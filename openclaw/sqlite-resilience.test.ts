@@ -6,6 +6,14 @@
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { mem0ConfigSchema, createProvider } from "./index.ts";
+import type { SearchRequest, ScopeFilter } from "./types.ts";
+
+// ---------------------------------------------------------------------------
+// Helper to create scope filter
+// ---------------------------------------------------------------------------
+function createScope(userId: string = "test-user"): ScopeFilter {
+  return { type: "user", userId };
+}
 
 // ---------------------------------------------------------------------------
 // 1. Config: disableHistory passthrough
@@ -13,6 +21,7 @@ import { mem0ConfigSchema, createProvider } from "./index.ts";
 describe("mem0ConfigSchema — disableHistory", () => {
   const baseConfig = {
     mode: "open-source",
+    defaultScope: { userId: "test-user" },
     oss: {
       embedder: { provider: "openai", config: { apiKey: "sk-test" } },
     },
@@ -67,19 +76,11 @@ describe("OSSProvider — disableHistory passthrough to Memory", () => {
           memoryCallCount++;
           capturedConfig = { ...config };
         }
-        async add() {
-          return { results: [] };
-        }
-        async search() {
-          return { results: [] };
-        }
-        async get() {
-          return {};
-        }
-        async getAll() {
-          return [];
-        }
-        async delete() {}
+        async add() { return { results: [] }; }
+        async search() { return { results: [] }; }
+        async get() { return {}; }
+        async getAll() { return []; }
+        async delete() { }
       },
     }));
   });
@@ -88,17 +89,20 @@ describe("OSSProvider — disableHistory passthrough to Memory", () => {
     const { createProvider } = await import("./index.ts");
     const cfg = mem0ConfigSchema.parse({
       mode: "open-source",
+      defaultScope: { userId: "test-user" },
       oss: { disableHistory: true },
     });
     const api = { resolvePath: (p: string) => p } as any;
-    const provider = createProvider(cfg, api);
+    const { provider } = createProvider(cfg, api);
 
-    // Trigger lazy init by calling search
+    // Trigger lazy init by calling search with new API
+    const request: SearchRequest = {
+      query: "test",
+      scope: createScope(),
+    };
     try {
-      await provider.search("test", { user_id: "u1" });
-    } catch {
-      /* provider may fail on mock, that's ok */
-    }
+      await provider.search(request);
+    } catch { /* provider may fail on mock, that's ok */ }
 
     expect(capturedConfig).toBeDefined();
     expect(capturedConfig!.disableHistory).toBe(true);
@@ -108,14 +112,19 @@ describe("OSSProvider — disableHistory passthrough to Memory", () => {
     const { createProvider } = await import("./index.ts");
     const cfg = mem0ConfigSchema.parse({
       mode: "open-source",
+      defaultScope: { userId: "test-user" },
       oss: {},
     });
     const api = { resolvePath: (p: string) => p } as any;
-    const provider = createProvider(cfg, api);
+    const { provider } = createProvider(cfg, api);
 
+    const request: SearchRequest = {
+      query: "test",
+      scope: createScope(),
+    };
     try {
-      await provider.search("test", { user_id: "u1" });
-    } catch {}
+      await provider.search(request);
+    } catch { }
 
     expect(capturedConfig).toBeDefined();
     expect(capturedConfig!.disableHistory).toBeUndefined();
@@ -140,19 +149,11 @@ describe("OSSProvider — initPromise retry after failure", () => {
           }
           // Second+ call succeeds
         }
-        async search() {
-          return { results: [] };
-        }
-        async get() {
-          return {};
-        }
-        async getAll() {
-          return [];
-        }
-        async add() {
-          return { results: [] };
-        }
-        async delete() {}
+        async search() { return { results: [] }; }
+        async get() { return {}; }
+        async getAll() { return []; }
+        async add() { return { results: [] }; }
+        async delete() { }
       },
     }));
   });
@@ -161,19 +162,25 @@ describe("OSSProvider — initPromise retry after failure", () => {
     const { createProvider } = await import("./index.ts");
     const cfg = mem0ConfigSchema.parse({
       mode: "open-source",
+      defaultScope: { userId: "test-user" },
       oss: { disableHistory: true },
     });
     const api = { resolvePath: (p: string) => p } as any;
-    const provider = createProvider(cfg, api);
+    const { provider } = createProvider(cfg, api);
+
+    const request: SearchRequest = {
+      query: "test",
+      scope: createScope(),
+    };
 
     // First call: _init throws, but initPromise is cleared so retry is possible
-    await expect(provider.search("test", { user_id: "u1" })).rejects.toThrow(
-      "SQLITE_CANTOPEN",
-    );
+    await expect(
+      provider.search(request),
+    ).rejects.toThrow("SQLITE_CANTOPEN");
 
     // Second call: should retry _init (not return cached rejection)
     // callCount === 1 threw, so callCount === 2 should succeed
-    const results = await provider.search("test", { user_id: "u1" });
+    const results = await provider.search(request);
     expect(results).toBeDefined();
     expect(callCount).toBe(2);
   });
@@ -197,19 +204,11 @@ describe("OSSProvider — graceful SQLite fallback", () => {
           }
           // Succeeds when disableHistory is true
         }
-        async search() {
-          return { results: [] };
-        }
-        async get() {
-          return {};
-        }
-        async getAll() {
-          return [];
-        }
-        async add() {
-          return { results: [] };
-        }
-        async delete() {}
+        async search() { return { results: [] }; }
+        async get() { return {}; }
+        async getAll() { return []; }
+        async add() { return { results: [] }; }
+        async delete() { }
       },
     }));
   });
@@ -219,13 +218,19 @@ describe("OSSProvider — graceful SQLite fallback", () => {
     const { createProvider } = await import("./index.ts");
     const cfg = mem0ConfigSchema.parse({
       mode: "open-source",
+      defaultScope: { userId: "test-user" },
       oss: {},
     });
     const api = { resolvePath: (p: string) => p } as any;
-    const provider = createProvider(cfg, api);
+    const { provider } = createProvider(cfg, api);
+
+    const request: SearchRequest = {
+      query: "test",
+      scope: createScope(),
+    };
 
     // Should succeed — first attempt fails, fallback with disableHistory succeeds
-    const results = await provider.search("test", { user_id: "u1" });
+    const results = await provider.search(request);
     expect(results).toBeDefined();
 
     // Memory constructor was called twice
@@ -254,15 +259,21 @@ describe("OSSProvider — graceful SQLite fallback", () => {
     const { createProvider } = await import("./index.ts");
     const cfg = mem0ConfigSchema.parse({
       mode: "open-source",
+      defaultScope: { userId: "test-user" },
       oss: { disableHistory: true },
     });
     const api = { resolvePath: (p: string) => p } as any;
-    const provider = createProvider(cfg, api);
+    const { provider } = createProvider(cfg, api);
+
+    const request: SearchRequest = {
+      query: "test",
+      scope: createScope(),
+    };
 
     // Should throw — no fallback possible when disableHistory was already set
-    await expect(provider.search("test", { user_id: "u1" })).rejects.toThrow(
-      "vector store connection refused",
-    );
+    await expect(
+      provider.search(request),
+    ).rejects.toThrow("vector store connection refused");
   });
 });
 
@@ -283,19 +294,11 @@ describe("PlatformProvider — initPromise retry after failure", () => {
             throw new Error("Network timeout");
           }
         }
-        async search() {
-          return [];
-        }
-        async get() {
-          return {};
-        }
-        async getAll() {
-          return [];
-        }
-        async add() {
-          return { results: [] };
-        }
-        async delete() {}
+        async search() { return []; }
+        async get() { return {}; }
+        async getAll() { return []; }
+        async add() { return { results: [] }; }
+        async delete() { }
       },
     }));
   });
@@ -305,17 +308,23 @@ describe("PlatformProvider — initPromise retry after failure", () => {
     const cfg = mem0ConfigSchema.parse({
       mode: "platform",
       apiKey: "test-api-key",
+      defaultScope: { userId: "test-user" },
     });
     const api = { resolvePath: (p: string) => p } as any;
-    const provider = createProvider(cfg, api);
+    const { provider } = createProvider(cfg, api);
+
+    const request: SearchRequest = {
+      query: "test",
+      scope: createScope(),
+    };
 
     // First call fails
-    await expect(provider.search("test", { user_id: "u1" })).rejects.toThrow(
-      "Network timeout",
-    );
+    await expect(
+      provider.search(request),
+    ).rejects.toThrow("Network timeout");
 
     // Second call should retry (not return cached rejection)
-    const results = await provider.search("test", { user_id: "u1" });
+    const results = await provider.search(request);
     expect(results).toBeDefined();
     expect(callCount).toBe(2);
   });

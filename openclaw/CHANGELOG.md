@@ -2,35 +2,35 @@
 
 All notable changes to the `@mem0/openclaw-mem0` plugin will be documented in this file.
 
-## [1.0.4] - 2026-04-04
+## [2.0.0] - 2026-04-03
+
+### Breaking Changes
+
+This is a complete refactor with no backward compatibility. Configuration and API have been redesigned.
+
+- **Configuration structure**: `userId` moved to `defaultScope.userId` (required), new `features` object for toggles
+- **Scope naming**: Removed `"long-term"` alias, use `"user"` instead
+- **Tool parameters**: Unified to camelCase (`userId`, `sessionId`, `orgId`, `appId`), removed `longTerm` boolean
 
 ### Added
-- **Interactive init flow**: `openclaw mem0 init` with interactive menu (email verification or direct API key). Non-interactive modes: `--api-key`, `--email`, `--email --code`
-- **`memory_add` tool**: Replaces `memory_store` — name now matches `mem0` CLI and platform API
-- **`memory_delete` tool**: Unified delete — single ID, search-then-delete, bulk, entity cascade. Replaces `memory_forget` and `memory_delete_all`
-- **CLI subcommands**: `openclaw mem0 init`, `openclaw mem0 status` (renamed from `stats`), `openclaw mem0 config show`, `openclaw mem0 config set`
-- **`fs-safe.ts` module**: Isolated filesystem wrappers (sync read/write/exists/mkdir/unlink) in a separate entry point — keeps file I/O out of the main bundle
-- **`backend/` module**: `PlatformBackend` with direct HTTP API access for CLI commands
-- **`cli/config-file.ts`**: Persistent plugin auth storage in `~/.openclaw/openclaw.json`
-- **Plugin manifest**: Added `contracts.tools`, `configSchema`, and `uiHints` to `openclaw.plugin.json`
-- **Test suite**: 329 tests across 10 test files covering tools, CLI, config, dream gate, providers, and skill-loader
+
+- **Conversation memory layer**: In-memory cache for single-turn context via `ConversationMemoryManager`
+- **Organization memory layer**: `orgId` and `appId` parameters for shared memories
+- **SQLite audit logging**: `AuditLogger` class records all CRUD operations (enable via `features.auditLog: true`)
+- **Unified request types**: `SearchRequest`, `StoreRequest`, `ListRequest` with `ScopeFilter`
 
 ### Changed
-- **Modular architecture**: Extracted tools into `tools/` directory (7 files) and CLI into `cli/commands.ts` — `index.ts` down from ~1700 to ~890 lines
-- **Code splitting**: tsup builds with `splitting: true` and two entry points (`index.ts`, `fs-safe.ts`), separating filesystem I/O from the main bundle
-- **Skills updated**: All SKILL.md files reference new tool names (`memory_add`, `memory_delete`) matching the plugin manifest
-- **WRITE_TOOLS updated**: Dream gate tracks `memory_delete` and `memory_add` instead of `memory_forget` and `memory_store`
-- **`mem0ai` dependency**: Updated from `2.3.0` to `2.4.5`
-- **Auto-recall timeout**: Recall wrapped in 8-second `Promise.race` — if the LLM takes too long, recall is skipped instead of stalling the gateway
-- **Auto-capture fire-and-forget**: `provider.add()` now runs in the background via `.then()/.catch()` — the `agent_end` hook returns immediately, zero event loop blocking
-- **Auto-capture minimum content gate**: Skips extraction when total user content is <50 chars after filtering — trivial conversations ("ok", "thanks") no longer trigger LLM calls
-- **CLI search**: Lowered threshold to 0.3 so explicit searches are more permissive than auto-recall
+
+- **Refactored types**: New `MemoryScope` enum, `ScopeFilter` interface, unified request/response types
+- **Refactored config**: Nested `defaultScope` and `features` objects, required `userId`
+- **Refactored providers**: `PlatformProvider` and `OSSProvider` use new request interfaces
+- **Refactored tools**: All 8 tools use unified scope parameters
 
 ### Removed
-- `memory_store` tool — replaced by `memory_add`
-- `memory_forget` tool — replaced by `memory_delete`
-- `memory_delete_all` tool — merged into `memory_delete`
-- **`custom_instructions` / `custom_categories` in `buildAddOptions`**: No longer injected into every auto-capture API call. Config fields (`customInstructions`, `customCategories`) remain as user-configurable options.
+
+- `"long-term"` scope alias (use `"user"`)
+- `longTerm` boolean parameter (use `scope` parameter)
+- Legacy flat config fields
 
 ## [1.0.3] - 2026-04-03
 

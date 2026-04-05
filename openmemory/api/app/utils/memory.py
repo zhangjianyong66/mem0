@@ -228,7 +228,7 @@ def get_default_memory_config():
     """Get default memory client configuration with sensible defaults."""
     # Detect vector store based on environment variables
     vector_store_config = {
-        "collection_name": "openmemory",
+        "collection_name": "memories",
         "host": "mem0_store",
     }
     
@@ -254,13 +254,13 @@ def get_default_memory_config():
             weaviate_port = int(os.environ.get('WEAVIATE_PORT'))
             cluster_url = f"http://{weaviate_host}:{weaviate_port}"
         vector_store_config = {
-            "collection_name": "openmemory",
+            "collection_name": "memories",
             "cluster_url": cluster_url
         }
     elif os.environ.get('REDIS_URL'):
         vector_store_provider = "redis"
         vector_store_config = {
-            "collection_name": "openmemory",
+            "collection_name": "memories",
             "redis_url": os.environ.get('REDIS_URL')
         }
     elif os.environ.get('PG_HOST') and os.environ.get('PG_PORT'):
@@ -280,7 +280,7 @@ def get_default_memory_config():
         milvus_url = f"http://{milvus_host}:{milvus_port}"
         
         vector_store_config = {
-            "collection_name": "openmemory",
+            "collection_name": "memories",
             "url": milvus_url,
             "token": os.environ.get('MILVUS_TOKEN', ''),  # Always include, empty string for local setup
             "db_name": os.environ.get('MILVUS_DB_NAME', ''),
@@ -313,7 +313,7 @@ def get_default_memory_config():
     elif os.environ.get('FAISS_PATH'):
         vector_store_provider = "faiss"
         vector_store_config = {
-            "collection_name": "openmemory",
+            "collection_name": "memories",
             "path": os.environ.get('FAISS_PATH'),
             "embedding_model_dims": 1536,
             "distance_strategy": "cosine"
@@ -361,6 +361,7 @@ def get_default_memory_config():
 
     return {
         "vector_store": {
+            "embedding_model_dims": 1024,
             "provider": vector_store_provider,
             "config": vector_store_config
         },

@@ -181,3 +181,65 @@ We now have a paper you can cite:
 ## ⚖️ License
 
 Apache 2.0 — see the [LICENSE](https://github.com/mem0ai/mem0/blob/main/LICENSE) file for details.
+
+---
+
+## 本地部署
+
+本项目已在本地部署，详细文档见：
+
+- [本地部署指南](./local-deployment/README.md) - 部署步骤、配置、故障排查
+- [Kimi 集成配置](./local-deployment/kimi-integration.md) - Kimi + mem0 集成
+- [部署脚本](./local-deployment/deploy.sh) - 一键启动/停止/备份脚本
+
+### 快速启动
+
+```bash
+cd local-deployment
+./deploy.sh start    # 启动服务
+./deploy.sh status   # 查看状态
+./deploy.sh backup   # 备份数据
+```
+
+### 当前部署状态
+
+- **OpenMemory API**: http://localhost:8765 (MCP Server)
+- **Qdrant 向量库**: http://localhost:6333
+- **部署时间**: 2026-04-05
+
+---
+
+## 本地部署
+
+本项目已在本地部署，详细文档见：
+
+- [本地部署指南](./local-deployment/README.md) - 部署步骤、配置、故障排查
+- [Kimi 集成配置](./local-deployment/kimi-integration.md) - Kimi + mem0 集成
+- [部署脚本](./local-deployment/deploy.sh) - 一键启动/停止/备份脚本
+
+### 快速启动
+
+```bash
+cd local-deployment
+./deploy.sh start    # 启动服务
+./deploy.sh status   # 查看状态
+./deploy.sh backup   # 备份数据
+```
+
+### 数据统一存储
+
+所有 mem0 数据现在统一管理在 `~/.mem0/` 目录：
+
+```
+~/.mem0/
+├── data/              # 数据库文件
+├── qdrant_data/       # 向量数据
+├── backup/            # 备份
+└── config/            # 配置
+```
+
+### 当前部署状态
+
+- **OpenMemory API**: http://localhost:8765 (MCP Server)
+- **Qdrant 向量库**: http://localhost:6333
+- **部署时间**: 2026-04-05
