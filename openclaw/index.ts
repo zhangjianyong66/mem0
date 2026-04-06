@@ -1107,6 +1107,10 @@ function registerHooks(
 
       const isSubagent = isSubagentSession(sessionId);
       const recallSessionKey = isSubagent ? undefined : sessionId;
+      
+      // Determine agent's allowed appIds based on sessionKey
+      // main/coder agents can access tech, product, and general memories
+      const allowedAppIds = getAgentAllowedAppIds(sessionId);
 
       try {
         const recallTopK = Math.max((cfg.topK ?? 5) * 2, 10);
@@ -1165,26 +1169,89 @@ function registerHooks(
           sessionResults = sessionResult.results;
         }
 
-        const userIds = new Set(userResults.map((r) => r.id));
-        const uniqueSessionResults = sessionResults.filter((r) => !userIds.has(r.id));
+        // Organization (shared) memory results - filtered by appId
+        let orgResults: MemoryItem[] = [];
+        const orgId = cfg.defaultScope.orgId;
+        if (orgId && allowedAppIds.length > 0) {
+          // Search for general memories (no appId)
+          const generalResult = await provider.search({
+            query: event.prompt,
+            scope: {
+              type: "organization",
+              orgId,
+            },
+            options: { limit: cfg.topK, threshold: cfg.searchThreshold },
+          });
+          
+          // Search for role-specific memories (with appId)
+          const roleResults: MemoryItem[] = [];
+          for (const appId of allowedAppIds) {
+            try {
+              const appResult = await provider.search({
+                query: event.prompt,
+                scope: {
+                  type: "organization",
+                  orgId,
+                  appId,
+                },
+                options: { limit: cfg.topK, threshold: cfg.searchThreshold },
+              });
+              roleResults.push(...appResult.results);
+            } catch (e) {
+              // Ignore errors for specific appIds
+            }
+          }
+          
+          // Merge and deduplicate
+          const seenIds = new Set<string>();
+          for (const r of [...generalResult.results, ...roleResults]) {
+            if (!seenIds.has(r.id)) {
+              seenIds.add(r.id);
+              orgResults.push(r);
+            }
+          }
+          
+          // Filter by score and limit
+          orgResults = orgResults
+            .filter((r) => (r.score ?? 0) >= cfg.searchThreshold)
+            .slice(0, cfg.topK);
+        }
 
-        if (userResults.length === 0 && uniqueSessionResults.length === 0) return;
+        // Merge all results
+        const allIds = new Set([...userResults, ...sessionResults].map((r) => r.id));
+        const uniqueOrgResults = orgResults.filter((r) => !allIds.has(r.id));
+
+        if (userResults.length === 0 && sessionResults.length === 0 && uniqueOrgResults.length === 0) {
+          return;
+        }
 
         let memoryContext = "";
+        
+        // User memories
         if (userResults.length > 0) {
           memoryContext += userResults
             .map((r) => `- ${r.memory}${r.categories?.length ? ` [${r.categories.join(", ")}]` : ""}`)
             .join("\n");
         }
+        
+        // Session memories
+        const uniqueSessionResults = sessionResults.filter((r) => !userResults.map(u => u.id).includes(r.id));
         if (uniqueSessionResults.length > 0) {
           if (memoryContext) memoryContext += "\n";
           memoryContext += "\nSession memories:\n";
           memoryContext += uniqueSessionResults.map((r) => `- ${r.memory}`).join("\n");
         }
+        
+        // Organization (shared) memories
+        if (uniqueOrgResults.length > 0) {
+          if (memoryContext) memoryContext += "\n";
+          memoryContext += "\nShared team memories:\n";
+          memoryContext += uniqueOrgResults.map((r) => `- ${r.memory}`).join("\n");
+        }
 
-        const totalCount = userResults.length + uniqueSessionResults.length;
+        const totalCount = userResults.length + uniqueSessionResults.length + uniqueOrgResults.length;
         api.logger.info(
-          `openclaw-mem0: injecting ${totalCount} memories (${userResults.length} user, ${uniqueSessionResults.length} session)`,
+          `openclaw-mem0: injecting ${totalCount} memories (${userResults.length} user, ${uniqueSessionResults.length} session, ${uniqueOrgResults.length} shared)`,
         );
 
         const preamble = isSubagent
@@ -1198,6 +1265,36 @@ function registerHooks(
         api.logger.warn(`openclaw-mem0: recall failed: ${String(err)}`);
       }
     });
+  }
+
+  /**
+   * Get allowed appIds for an agent based on session key
+   * This determines which shared memories the agent can access
+   */
+  function getAgentAllowedAppIds(sessionKey: string | undefined): string[] {
+    if (!sessionKey) return ["tech", "product", "general"];
+    
+    // Extract agentId from session key (agent:<agentId>:<session>)
+    const match = sessionKey.match(/^agent:([^:]+):/);
+    const agentId = match?.[1];
+    
+    switch (agentId) {
+      case "main":
+        // Main agent (土豆) - can access tech, product, and general
+        return ["tech", "product", "general"];
+      case "coder":
+        // Coder agent (猴子) - primarily tech-focused
+        return ["tech", "general"];
+      case "product":
+        // Product agent - product and general
+        return ["product", "general"];
+      case "operation":
+        // Operation agent - operation and general
+        return ["operation", "general"];
+      default:
+        // Default: allow all
+        return ["tech", "product", "operation", "general"];
+    }
   }
 
   // Auto-capture
@@ -1224,21 +1321,334 @@ function registerHooks(
         const filtered = filterMessagesForExtraction(event.messages);
         if (!filtered.length) return;
 
-        await provider.add({
-          facts: filtered.map((m) => m.content),
-          scope: {
-            type: "session",
-            userId: _effectiveUserId(sessionId),
-            sessionId,
-          },
-        });
+        const userId = _effectiveUserId(sessionId);
+        const orgId = cfg.defaultScope.orgId;
+        
+        // Get LLM config for content classification
+        const llmConfig: LLMConfig | undefined = cfg.oss?.llm ? {
+          provider: cfg.oss.llm.provider,
+          config: cfg.oss.llm.config as LLMConfig["config"],
+        } : undefined;
 
-        api.logger.info(`openclaw-mem0: captured ${filtered.length} messages`);
+        // Analyze and categorize content using LLM
+        const personalFacts: string[] = [];
+        const sharedFactsByAppId: Map<string | undefined, { content: string; category: string }[]> = new Map();
+
+        for (const msg of filtered) {
+          const content = msg.content;
+          const classification = await classifyContentWithLLM(content, llmConfig);
+          
+          if (classification.isShared && orgId) {
+            const appId = classification.appId;
+            if (!sharedFactsByAppId.has(appId)) {
+              sharedFactsByAppId.set(appId, []);
+            }
+            sharedFactsByAppId.get(appId)!.push({ 
+              content, 
+              category: classification.category 
+            });
+          } else if (!classification.isShared) {
+            personalFacts.push(content);
+          }
+        }
+
+        // Save personal memories to user scope
+        if (personalFacts.length > 0) {
+          await provider.add({
+            facts: personalFacts,
+            scope: {
+              type: "session",
+              userId,
+              sessionId,
+            },
+          });
+        }
+
+        // Save shared memories to organization scope with appId filtering
+        let totalShared = 0;
+        for (const [appId, facts] of sharedFactsByAppId) {
+          if (facts.length === 0) continue;
+          
+          const sharedContents = facts.map(f => f.content);
+          const scope: any = {
+            type: "organization",
+            orgId,
+          };
+          if (appId) {
+            scope.appId = appId;
+          }
+          
+          await provider.add({
+            facts: sharedContents,
+            scope,
+          });
+          
+          const categories = [...new Set(facts.map(f => f.category))].join(", ");
+          const appIdLabel = appId || "general";
+          api.logger.info(`openclaw-mem0: captured ${facts.length} shared messages to org:${appIdLabel} [${categories}]`);
+          totalShared += facts.length;
+        }
+
+        api.logger.info(`openclaw-mem0: captured ${filtered.length} messages (personal: ${personalFacts.length}, shared: ${totalShared})`);
       } catch (err) {
         api.logger.warn(`openclaw-mem0: capture failed: ${String(err)}`);
       }
     });
   }
+}
+
+/**
+ * Configuration for LLM-based shared content classification
+ */
+interface LLMConfig {
+  provider: string;
+  config: {
+    model: string;
+    baseURL?: string;
+    apiKey?: string;
+    temperature?: number;
+  };
+}
+
+/**
+ * Content classification result with appId for role-based filtering
+ */
+interface ContentClassification {
+  isShared: boolean;
+  appId: string | undefined;  // "tech", "product", "operation", "general", or undefined
+  category: string;
+  reason: string;
+}
+
+/**
+ * Map content category to appId for role-based memory isolation
+ */
+function categoryToAppId(category: string): string | undefined {
+  const categoryLower = category.toLowerCase();
+  
+  // Technical categories → tech
+  if (/架构|规范|API|环境|部署|流程|故障|监控|工具|backend|frontend|devops|数据库/.test(categoryLower)) {
+    return "tech";
+  }
+  
+  // Product categories → product
+  if (/产品|需求|设计|用户|功能|优先级|roadmap|需求/.test(categoryLower)) {
+    return "product";
+  }
+  
+  // Operation categories → operation
+  if (/运营|数据|分析|营销|活动|用户增长|留存|转化/.test(categoryLower)) {
+    return "operation";
+  }
+  
+  // General categories → no appId (org level)
+  if (/通用|团队|规范|流程|个人|general/.test(categoryLower)) {
+    return undefined;
+  }
+  
+  // Default to undefined (shared at org level)
+  return undefined;
+}
+
+/**
+ * Use LLM to analyze if content is suitable for shared/organization memory.
+ * This provides intelligent classification based on content semantics.
+ */
+async function classifyContentWithLLM(
+  content: string,
+  llmConfig: LLMConfig | undefined
+): Promise<ContentClassification> {
+  // If no LLM config, fall back to rule-based classification
+  if (!llmConfig) {
+    const isShared = isSharedContentRuleBased(content);
+    return { 
+      isShared, 
+      appId: undefined, 
+      category: "rule-based", 
+      reason: "fallback to rule-based" 
+    };
+  }
+
+  const prompt = `你是一位团队协作记忆管理专家。请分析以下对话内容，判断是否适合保存为团队共享记忆，并判断适合哪些角色查看。
+
+## 团队角色：
+- **技术团队 (tech)**：开发工程师、测试工程师、运维工程师
+- **产品团队 (product)**：产品经理、产品运营
+- **运营团队 (operation)**：用户运营、数据运营、市场运营
+- **通用 (general)**：所有角色都需要了解
+
+## 适合共享的记忆类型及对应角色：
+
+### 技术团队专属 (tech)
+- 项目架构和技术栈（如："系统采用微服务架构，使用 K8s 部署"）
+- 技术规范和标准（如："代码必须使用 ESLint，2 空格缩进"）
+- API 设计和接口规范（如："用户接口返回统一格式 {code, data, message}"）
+- 环境配置信息（如："生产数据库是 PostgreSQL 15，连接池 100"）
+- 部署和发布流程（如："发布需要经过测试 → 预发 → 生产"）
+- 故障处理和运维经验（如："数据库连接超时需检查连接池配置"）
+- 监控告警规则（如："CPU > 80% 触发告警，通知运维"）
+- 通用工具和方法（如："使用 Docker Compose 本地启动服务"）
+
+### 产品团队专属 (product)
+- 产品需求和决策（如："这个功能优先级 P0，本周上线"）
+- 用户需求和场景（如："用户反馈需要导出功能"）
+- 产品设计规范（如："按钮颜色使用主色调蓝色"）
+- 迭代计划和 Roadmap
+
+### 运营团队专属 (operation)
+- 运营活动方案（如："618 活动方案，目标 GMV 1000 万"）
+- 数据分析结果（如："昨日新增用户 1000，留存率 30%"）
+- 用户增长策略
+- 营销渠道信息
+
+### 通用信息 (general)
+- 团队规范和制度（如："周会时间每周五下午 3 点"）
+- 项目整体介绍
+- 跨团队协作流程
+
+## 不适合共享的记忆类型：
+1. 个人主观意见（如："我觉得..."、"我认为..."）
+2. 个人帮助请求（如："帮我查一下..."、"给我写个..."）
+3. 临时性调试命令或代码片段
+4. 针对具体 bug 的一次性讨论
+5. 个人信息或偏好设置
+
+## 待分析内容：
+"""
+${content}
+"""
+
+请按以下格式回复（必须是有效 JSON）：
+{
+  "isShared": true/false,
+  "confidence": 0-1,
+  "appId": "tech/product/operation/general",
+  "category": "详细分类如：架构/规范/API/环境/流程/故障/监控/产品需求/运营活动/通用",
+  "reason": "简短说明判断原因"
+}`;
+
+  try {
+    const response = await callLLM(prompt, llmConfig);
+    const result = parseLLMResponse(response);
+    
+    const isShared = result.isShared && result.confidence > 0.6;
+    const appId = isShared ? (result.appId || categoryToAppId(result.category)) : undefined;
+    
+    return {
+      isShared,
+      appId,
+      category: result.category,
+      reason: result.reason,
+    };
+  } catch (err) {
+    // Fall back to rule-based on error
+    const isShared = isSharedContentRuleBased(content);
+    return { 
+      isShared, 
+      appId: undefined, 
+      category: "rule-based", 
+      reason: "fallback to rule-based" 
+    };
+  }
+}
+
+/**
+ * Call LLM API for content classification
+ */
+async function callLLM(prompt: string, llmConfig: LLMConfig): Promise<string> {
+  const { provider, config } = llmConfig;
+  
+  if (provider === "openai" || config.baseURL?.includes("dashscope")) {
+    // OpenAI-compatible API (including Aliyun DashScope)
+    const response = await fetch(config.baseURL + "/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: config.model,
+        messages: [{ role: "user", content: prompt }],
+        temperature: config.temperature ?? 0.1,
+        max_tokens: 500,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`LLM API error: ${response.status}`);
+    }
+
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content || "";
+  }
+
+  throw new Error(`Unsupported LLM provider: ${provider}`);
+}
+
+/**
+ * Parse LLM response to extract classification result
+ */
+function parseLLMResponse(response: string): {
+  isShared: boolean;
+  confidence: number;
+  appId: string | undefined;
+  category: string;
+  reason: string;
+} {
+  try {
+    // Extract JSON from response (handle markdown code blocks)
+    const jsonMatch = response.match(/```json\s*([\s\S]*?)\s*```/) ||
+                      response.match(/```\s*([\s\S]*?)\s*```/) ||
+                      response.match(/(\{[\s\S]*\})/);
+    
+    const jsonStr = jsonMatch ? jsonMatch[1] : response;
+    const result = JSON.parse(jsonStr);
+
+    return {
+      isShared: Boolean(result.isShared),
+      confidence: Number(result.confidence) || 0.5,
+      appId: result.appId || undefined,
+      category: String(result.category || "未分类"),
+      reason: String(result.reason || "无说明"),
+    };
+  } catch (err) {
+    // Default to not shared if parsing fails
+    return { isShared: false, confidence: 0, appId: undefined, category: "解析失败", reason: String(err) };
+  }
+}
+
+/**
+ * Rule-based fallback for content classification
+ */
+function isSharedContentRuleBased(content: string): boolean {
+  const lower = content.toLowerCase();
+  
+  // Shared content patterns
+  const sharedPatterns = [
+    /^(我们?的?(项目|系统|架构|设计)是|项目使用|技术栈|框架|架构)/,
+    /^(配置|设置|参数|环境)/,
+    /^(最佳实践|规范|标准|约定)/,
+    /^(流程|步骤|方法|方案)/,
+    /^(文档|说明|手册|指南)/,
+    /(统一|一致|共同|通用)/,
+    /(所有人|大家|团队)/,
+    /^(api|接口|接口地址|endpoint|url)/i,
+    /^(数据库|db|表结构|schema)/i,
+    /^(版本|version|依赖|dependency)/i,
+  ];
+  
+  // Personal content patterns (not shared)
+  const personalPatterns = [
+    /(我觉得|我认为|我想|我感觉)/,
+    /^(我|帮我|给我)/,
+    /(请帮我|帮我|给我)/,
+  ];
+  
+  if (personalPatterns.some(p => p.test(lower))) {
+    return false;
+  }
+  
+  return sharedPatterns.some(p => p.test(lower));
 }
 
 // ============================================================================

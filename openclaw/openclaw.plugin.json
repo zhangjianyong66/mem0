@@ -1,7 +1,9 @@
 {
   "id": "openclaw-mem0",
   "kind": "memory",
-  "skills": ["skills"],
+  "skills": [
+    "skills"
+  ],
   "uiHints": {
     "mode": {
       "label": "Mode",
@@ -106,7 +108,11 @@
     "properties": {
       "mode": {
         "type": "string",
-        "enum": ["platform", "open-source", "oss"],
+        "enum": [
+          "platform",
+          "open-source",
+          "oss"
+        ],
         "default": "platform"
       },
       "apiKey": {
@@ -131,7 +137,10 @@
             "description": "Optional. Application ID for app-specific memories"
           }
         },
-        "required": ["userId"]
+        "required": [
+          "userId"
+        ],
+        "additionalProperties": true
       },
       "features": {
         "type": "object",
@@ -179,26 +188,45 @@
       },
       "oss": {
         "type": "object",
+        "additionalProperties": true,
         "properties": {
           "embedder": {
             "type": "object",
+            "additionalProperties": true,
             "properties": {
-              "provider": { "type": "string" },
-              "config": { "type": "object" }
+              "provider": {
+                "type": "string"
+              },
+              "config": {
+                "type": "object",
+                "additionalProperties": true
+              }
             }
           },
           "vectorStore": {
             "type": "object",
+            "additionalProperties": true,
             "properties": {
-              "provider": { "type": "string" },
-              "config": { "type": "object" }
+              "provider": {
+                "type": "string"
+              },
+              "config": {
+                "type": "object",
+                "additionalProperties": true
+              }
             }
           },
           "llm": {
             "type": "object",
+            "additionalProperties": true,
             "properties": {
-              "provider": { "type": "string" },
-              "config": { "type": "object" }
+              "provider": {
+                "type": "string"
+              },
+              "config": {
+                "type": "object",
+                "additionalProperties": true
+              }
             }
           },
           "historyDbPath": {
@@ -215,51 +243,119 @@
           "triage": {
             "type": "object",
             "properties": {
-              "enabled": { "type": "boolean" },
-              "importanceThreshold": { "type": "number" },
-              "enableGraph": { "type": "boolean" },
-              "credentialPatterns": { "type": "array", "items": { "type": "string" } }
+              "enabled": {
+                "type": "boolean"
+              },
+              "importanceThreshold": {
+                "type": "number"
+              },
+              "enableGraph": {
+                "type": "boolean"
+              },
+              "credentialPatterns": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
             }
           },
           "recall": {
             "type": "object",
             "properties": {
-              "enabled": { "type": "boolean" },
-              "strategy": { "type": "string", "enum": ["always", "smart", "manual"] },
-              "tokenBudget": { "type": "number" },
-              "maxMemories": { "type": "number" },
-              "rerank": { "type": "boolean" },
-              "keywordSearch": { "type": "boolean" },
-              "filterMemories": { "type": "boolean" },
-              "threshold": { "type": "number" },
-              "identityAlwaysInclude": { "type": "boolean" },
-              "categoryOrder": { "type": "array", "items": { "type": "string" } }
+              "enabled": {
+                "type": "boolean"
+              },
+              "strategy": {
+                "type": "string",
+                "enum": [
+                  "always",
+                  "smart",
+                  "manual"
+                ]
+              },
+              "tokenBudget": {
+                "type": "number"
+              },
+              "maxMemories": {
+                "type": "number"
+              },
+              "rerank": {
+                "type": "boolean"
+              },
+              "keywordSearch": {
+                "type": "boolean"
+              },
+              "filterMemories": {
+                "type": "boolean"
+              },
+              "threshold": {
+                "type": "number"
+              },
+              "identityAlwaysInclude": {
+                "type": "boolean"
+              },
+              "categoryOrder": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
             }
           },
           "dream": {
             "type": "object",
             "properties": {
-              "enabled": { "type": "boolean" },
-              "schedule": { "type": "string" },
-              "mergeThreshold": { "type": "number" },
-              "maxMemoriesPerUser": { "type": "number" },
-              "preserveImmutable": { "type": "boolean" },
-              "credentialScan": { "type": "boolean" },
-              "expireStaleAfterDays": { "type": "number" }
+              "enabled": {
+                "type": "boolean"
+              },
+              "schedule": {
+                "type": "string"
+              },
+              "mergeThreshold": {
+                "type": "number"
+              },
+              "maxMemoriesPerUser": {
+                "type": "number"
+              },
+              "preserveImmutable": {
+                "type": "boolean"
+              },
+              "credentialScan": {
+                "type": "boolean"
+              },
+              "expireStaleAfterDays": {
+                "type": "number"
+              }
             }
           },
-          "domain": { "type": "string" },
+          "domain": {
+            "type": "string"
+          },
           "customRules": {
             "type": "object",
             "properties": {
-              "include": { "type": "array", "items": { "type": "string" } },
-              "exclude": { "type": "array", "items": { "type": "string" } }
+              "include": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "exclude": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
             }
           },
-          "categories": { "type": "object" }
+          "categories": {
+            "type": "object"
+          }
         }
       }
     },
     "required": ["defaultScope"]
-  }
+  },
+  "_cacheBust": "1775470330"
 }
