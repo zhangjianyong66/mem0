@@ -6,14 +6,11 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import type {
   Mem0Config,
   Mem0Provider,
+  AddOptions,
+  SearchOptions,
+  ListOptions,
   MemoryItem,
-  StoreRequest,
-  SearchRequest,
-  ListRequest,
-  ScopeFilter,
-  HistoryEntry,
-  StoreResult,
-  SearchResult,
+  AddResult,
 } from "./types.ts";
 
 // ============================================================================
@@ -24,38 +21,50 @@ function normalizeMemoryItem(raw: any): MemoryItem {
   return {
     id: raw.id ?? raw.memory_id ?? "",
     memory: raw.memory ?? raw.text ?? raw.content ?? "",
-    userId: raw.user_id ?? raw.userId,
+    // Handle both platform (user_id, created_at) and OSS (userId, createdAt) field names
+    user_id: raw.user_id ?? raw.userId,
     score: raw.score,
     categories: raw.categories,
     metadata: raw.metadata,
-    createdAt: raw.created_at ?? raw.createdAt,
-    updatedAt: raw.updated_at ?? raw.updatedAt,
+    created_at: raw.created_at ?? raw.createdAt,
+    updated_at: raw.updated_at ?? raw.updatedAt,
   };
 }
 
 function normalizeSearchResults(raw: any): MemoryItem[] {
+  // Platform API returns flat array, OSS returns { results: [...] }
   if (Array.isArray(raw)) return raw.map(normalizeMemoryItem);
   if (raw?.results && Array.isArray(raw.results))
     return raw.results.map(normalizeMemoryItem);
   return [];
 }
 
-function normalizeStoreResult(raw: any): StoreResult {
+function normalizeAddResult(raw: any): AddResult {
+  // Handle { results: [...] } shape (both platform and OSS)
   if (raw?.results && Array.isArray(raw.results)) {
     return {
       results: raw.results.map((r: any) => ({
         id: r.id ?? r.memory_id ?? "",
         memory: r.memory ?? r.text ?? "",
-        event: r.event ?? r.metadata?.event ?? (r.status === "PENDING" ? "ADD" : "ADD"),
+        // Platform API may return PENDING status (async processing)
+        // OSS stores event in metadata.event
+        event:
+          r.event ??
+          r.metadata?.event ??
+          (r.status === "PENDING" ? "ADD" : "ADD"),
       })),
     };
   }
+  // Platform API without output_format returns flat array
   if (Array.isArray(raw)) {
     return {
       results: raw.map((r: any) => ({
         id: r.id ?? r.memory_id ?? "",
         memory: r.memory ?? r.text ?? "",
-        event: r.event ?? r.metadata?.event ?? (r.status === "PENDING" ? "ADD" : "ADD"),
+        event:
+          r.event ??
+          r.metadata?.event ??
+          (r.status === "PENDING" ? "ADD" : "ADD"),
       })),
     };
   }
@@ -63,196 +72,17 @@ function normalizeStoreResult(raw: any): StoreResult {
 }
 
 // ============================================================================
-// Scope Filter Helpers
-// ============================================================================
-
-/**
- * Convert ScopeFilter to provider-specific parameters.
- */
-function scopeToParams(scope: ScopeFilter): Record<string, unknown> {
-  const params: Record<string, unknown> = {};
-
-  if (scope.userId) params.user_id = scope.userId;
-  if (scope.sessionId) params.run_id = scope.sessionId;
-  if (scope.orgId) params.org_id = scope.orgId;
-  if (scope.appId) params.app_id = scope.appId;
-  if (scope.conversationId) params.conversation_id = scope.conversationId;
-
-  return params;
-}
-
-// ============================================================================
-// Audit Logger
-// ============================================================================
-
-interface AuditLogEntry {
-  id: string;
-  operation: string;
-  memoryId?: string;
-  userId?: string;
-  scopeType?: string;
-  query?: string;
-  resultCount?: number;
-  metadata?: string;
-  durationMs?: number;
-}
-
-/**
- * Audit logger for recording all memory operations.
- */
-export class AuditLogger {
-  private dbPath: string | undefined;
-  private enabled: boolean;
-
-  constructor(dbPath?: string, enabled: boolean = false) {
-    this.dbPath = dbPath;
-    this.enabled = enabled;
-  }
-
-  async log(entry: Omit<AuditLogEntry, "id">): Promise<void> {
-    if (!this.enabled || !this.dbPath) return;
-
-    try {
-      const Database = (await import("better-sqlite3")).default;
-      const db = new Database(this.dbPath);
-
-      db.exec(`
-        CREATE TABLE IF NOT EXISTS audit_log (
-          id           TEXT PRIMARY KEY,
-          operation    TEXT NOT NULL,
-          memory_id    TEXT,
-          user_id      TEXT,
-          scope_type   TEXT,
-          query        TEXT,
-          result_count INTEGER,
-          metadata     TEXT,
-          created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
-          duration_ms  INTEGER
-        )
-      `);
-
-      const id = crypto.randomUUID();
-      const stmt = db.prepare(`
-        INSERT INTO audit_log (id, operation, memory_id, user_id, scope_type, query, result_count, metadata, duration_ms)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-
-      stmt.run(
-        id,
-        entry.operation,
-        entry.memoryId ?? null,
-        entry.userId ?? null,
-        entry.scopeType ?? null,
-        entry.query ?? null,
-        entry.resultCount ?? null,
-        entry.metadata ?? null,
-        entry.durationMs ?? null
-      );
-
-      db.close();
-    } catch (err) {
-      console.warn("[mem0] Audit log write failed:", err instanceof Error ? err.message : err);
-    }
-  }
-
-  async getRecent(limit: number = 100): Promise<AuditLogEntry[]> {
-    if (!this.dbPath) return [];
-
-    try {
-      const Database = (await import("better-sqlite3")).default;
-      const db = new Database(this.dbPath);
-
-      const stmt = db.prepare(`
-        SELECT id, operation, memory_id, user_id, scope_type, query, result_count, metadata, created_at, duration_ms
-        FROM audit_log
-        ORDER BY created_at DESC
-        LIMIT ?
-      `);
-
-      const rows = stmt.all(limit) as AuditLogEntry[];
-      db.close();
-      return rows;
-    } catch {
-      return [];
-    }
-  }
-}
-
-// ============================================================================
-// Conversation Memory Manager
-// ============================================================================
-
-interface ConversationMemory {
-  content: string;
-  timestamp: number;
-  conversationId: string;
-}
-
-/**
- * Manages conversation-scoped temporary memories (in-memory only).
- */
-export class ConversationMemoryManager {
-  private cache: Map<string, ConversationMemory> = new Map();
-  private ttl: number;
-
-  constructor(ttl: number = 60000) {
-    this.ttl = ttl;
-    setInterval(() => this.cleanup(), ttl);
-  }
-
-  set(conversationId: string, content: string): void {
-    this.cache.set(conversationId, {
-      content,
-      timestamp: Date.now(),
-      conversationId,
-    });
-  }
-
-  get(conversationId: string): string | undefined {
-    const memory = this.cache.get(conversationId);
-    if (!memory) return undefined;
-
-    if (Date.now() - memory.timestamp > this.ttl) {
-      this.cache.delete(conversationId);
-      return undefined;
-    }
-
-    return memory.content;
-  }
-
-  clear(conversationId: string): void {
-    this.cache.delete(conversationId);
-  }
-
-  clearAll(): void {
-    this.cache.clear();
-  }
-
-  getAll(): ConversationMemory[] {
-    this.cleanup();
-    return Array.from(this.cache.values());
-  }
-
-  private cleanup(): void {
-    const now = Date.now();
-    for (const [key, memory] of this.cache.entries()) {
-      if (now - memory.timestamp > this.ttl) {
-        this.cache.delete(key);
-      }
-    }
-  }
-}
-
-// ============================================================================
 // Platform Provider (Mem0 Cloud)
 // ============================================================================
 
 class PlatformProvider implements Mem0Provider {
-  private client: any;
+  private client: any; // MemoryClient from mem0ai
   private initPromise: Promise<void> | null = null;
 
   constructor(
     private readonly apiKey: string,
+    private readonly baseUrl?: string,
+    private readonly orgId?: string,
     private readonly projectId?: string,
   ) {}
 
@@ -268,115 +98,130 @@ class PlatformProvider implements Mem0Provider {
 
   private async _init(): Promise<void> {
     const { default: MemoryClient } = await import("mem0ai");
-    const opts: { apiKey: string; project_id?: string } = { apiKey: this.apiKey };
-    if (this.projectId) opts.project_id = this.projectId;
+    const opts: {
+      apiKey: string;
+      host?: string;
+      organizationId?: string;
+      projectId?: string;
+    } = {
+      apiKey: this.apiKey,
+    };
+    if (this.baseUrl) opts.host = this.baseUrl;
+    if (this.orgId) opts.organizationId = this.orgId;
+    if (this.projectId) opts.projectId = this.projectId;
     this.client = new MemoryClient(opts);
   }
 
-  async add(request: StoreRequest): Promise<StoreResult> {
+  async add(
+    messages: Array<{ role: string; content: string }>,
+    options: AddOptions,
+  ): Promise<AddResult> {
     await this.ensureClient();
+    const opts: Record<string, unknown> = { user_id: options.user_id };
+    if (options.run_id) opts.run_id = options.run_id;
+    if (options.custom_instructions)
+      opts.custom_instructions = options.custom_instructions;
+    if (options.custom_categories)
+      opts.custom_categories = options.custom_categories;
+    if (options.enable_graph) opts.enable_graph = options.enable_graph;
+    if (options.output_format) opts.output_format = options.output_format;
+    if (options.source) opts.source = options.source;
+    // Agentic harness: direct storage bypass
+    if (options.infer !== undefined) opts.infer = options.infer;
+    if (options.deduced_memories)
+      opts.deduced_memories = options.deduced_memories;
+    if (options.metadata) opts.metadata = options.metadata;
+    if (options.expiration_date) opts.expiration_date = options.expiration_date;
+    if (options.immutable) opts.immutable = options.immutable;
 
-    const params: Record<string, unknown> = {
-      ...scopeToParams(request.scope),
-      output_format: "v1.1",
+    const result = await this.client.add(messages, opts);
+    return normalizeAddResult(result);
+  }
+
+  async search(query: string, options: SearchOptions): Promise<MemoryItem[]> {
+    await this.ensureClient();
+    const opts: Record<string, unknown> = {
+      api_version: "v2",
+      user_id: options.user_id,
     };
+    if (options.run_id) opts.run_id = options.run_id;
+    if (options.top_k != null) opts.top_k = options.top_k;
+    if (options.threshold != null) opts.threshold = options.threshold;
+    if (options.keyword_search != null)
+      opts.keyword_search = options.keyword_search;
+    if (options.reranking != null) opts.rerank = options.reranking;
+    if (options.filter_memories != null)
+      opts.filter_memories = options.filter_memories;
+    if (options.categories != null) opts.categories = options.categories;
+    const baseFilters: Record<string, unknown> = { user_id: options.user_id };
+    if (options.run_id) baseFilters.run_id = options.run_id;
 
-    // Store each fact
-    const results: Array<{ id: string; memory: string; event: "ADD" | "UPDATE" | "DELETE" | "NOOP" }> = [];
-
-    for (const fact of request.facts) {
-      const result = await this.client.add(
-        [{ role: "user", content: fact }],
-        params
-      );
-
-      if (result?.results) {
-        for (const r of result.results) {
-          results.push({
-            id: r.id ?? r.memory_id ?? "",
-            memory: r.memory ?? fact,
-            event: r.event ?? "ADD",
-          });
-        }
-      } else if (Array.isArray(result)) {
-        for (const r of result) {
-          results.push({
-            id: r.id ?? r.memory_id ?? "",
-            memory: r.memory ?? fact,
-            event: r.event ?? "ADD",
-          });
-        }
-      }
+    if (options.filters) {
+      opts.filters = { AND: [baseFilters, options.filters] };
+    } else {
+      opts.filters = baseFilters;
     }
 
-    return { results };
+    const results = await this.client.search(query, opts);
+    return normalizeSearchResults(results);
   }
 
-  async search(request: SearchRequest): Promise<SearchResult> {
+  async get(memoryId: string): Promise<MemoryItem> {
     await this.ensureClient();
-
-    const params: Record<string, unknown> = {
-      api_version: "v2",
-      filters: scopeToParams(request.scope),
-    };
-
-    if (request.options?.limit) params.top_k = request.options.limit;
-    if (request.options?.threshold) params.threshold = request.options.threshold;
-    if (request.options?.categories) params.categories = request.options.categories;
-    if (request.options?.keywordSearch) params.keyword_search = request.options.keywordSearch;
-    if (request.options?.rerank) params.rerank = request.options.rerank;
-
-    const results = await this.client.search(request.query, params);
-    return { results: normalizeSearchResults(results) };
-  }
-
-  async get(id: string): Promise<MemoryItem> {
-    await this.ensureClient();
-    const result = await this.client.get(id);
+    const result = await this.client.get(memoryId);
     return normalizeMemoryItem(result);
   }
 
-  async update(id: string, data: { text: string; metadata?: Record<string, unknown> }): Promise<void> {
+  async getAll(options: ListOptions): Promise<MemoryItem[]> {
     await this.ensureClient();
-    await this.client.update(id, { text: data.text, metadata: data.metadata });
-  }
-
-  async delete(id: string): Promise<void> {
-    await this.ensureClient();
-    await this.client.delete(id);
-  }
-
-  async list(request: ListRequest): Promise<MemoryItem[]> {
-    await this.ensureClient();
-
-    const params: Record<string, unknown> = {
-      ...scopeToParams(request.scope),
+    const opts: Record<string, unknown> = {
+      api_version: "v2",
+      user_id: options.user_id,
+      filters: { user_id: options.user_id },
     };
+    if (options.run_id) {
+      opts.run_id = options.run_id;
+      (opts.filters as Record<string, unknown>).run_id = options.run_id;
+    }
+    if (options.page_size != null) opts.page_size = options.page_size;
 
-    if (request.limit) params.page_size = request.limit;
-
-    const results = await this.client.getAll(params);
+    const results = await this.client.getAll(opts);
     if (Array.isArray(results)) return results.map(normalizeMemoryItem);
-    if (results?.results) return results.results.map(normalizeMemoryItem);
+    // Some versions return { results: [...] }
+    if (results?.results && Array.isArray(results.results))
+      return results.results.map(normalizeMemoryItem);
     return [];
   }
 
-  async deleteAll(scope: ScopeFilter): Promise<void> {
+  async update(memoryId: string, text: string): Promise<void> {
     await this.ensureClient();
-    const params = scopeToParams(scope);
-    await this.client.deleteAll(params);
+    await this.client.update(memoryId, { text });
   }
 
-  async history(id: string): Promise<HistoryEntry[]> {
+  async delete(memoryId: string): Promise<void> {
     await this.ensureClient();
-    const result = await this.client.history(id);
-    return Array.isArray(result) ? result.map((h: any) => ({
-      id: h.id,
-      oldMemory: h.old_memory,
-      newMemory: h.new_memory,
-      event: h.event,
-      createdAt: h.created_at,
-    })) : [];
+    await this.client.delete(memoryId);
+  }
+
+  async deleteAll(userId: string): Promise<void> {
+    await this.ensureClient();
+    await this.client.deleteAll({ user_id: userId });
+  }
+
+  async history(
+    memoryId: string,
+  ): Promise<
+    Array<{
+      id: string;
+      old_memory: string;
+      new_memory: string;
+      event: string;
+      created_at: string;
+    }>
+  > {
+    await this.ensureClient();
+    const result = await this.client.history(memoryId);
+    return Array.isArray(result) ? result : [];
   }
 }
 
@@ -385,11 +230,12 @@ class PlatformProvider implements Mem0Provider {
 // ============================================================================
 
 class OSSProvider implements Mem0Provider {
-  private memory: any;
+  private memory: any; // Memory from mem0ai/oss
   private initPromise: Promise<void> | null = null;
 
   constructor(
     private readonly ossConfig?: Mem0Config["oss"],
+    private readonly customPrompt?: string,
     private readonly resolvePath?: (p: string) => string,
   ) {}
 
@@ -408,9 +254,38 @@ class OSSProvider implements Mem0Provider {
 
     const config: Record<string, unknown> = { version: "v1.1" };
 
-    if (this.ossConfig?.embedder) config.embedder = this.ossConfig.embedder;
-    if (this.ossConfig?.vectorStore) config.vectorStore = this.ossConfig.vectorStore;
-    if (this.ossConfig?.llm) config.llm = this.ossConfig.llm;
+    const defaultEmbedder = { provider: "openai", config: { model: "text-embedding-3-small" } };
+    const defaultLlm = { provider: "openai", config: { model: "gpt-5.4" } };
+
+    // Helper: strip empty-string values so they don't clobber defaults
+    const stripEmpty = (obj: Record<string, unknown>) => {
+      const out = { ...obj };
+      for (const k of Object.keys(out)) { if (out[k] === "") delete out[k]; }
+      return out;
+    };
+
+    if (this.ossConfig?.embedder) {
+      const ec = stripEmpty(this.ossConfig.embedder.config ?? {});
+      config.embedder = {
+        provider: this.ossConfig.embedder.provider || defaultEmbedder.provider,
+        config: { ...defaultEmbedder.config, ...ec },
+      };
+    } else {
+      config.embedder = defaultEmbedder;
+    }
+
+    if (this.ossConfig?.llm) {
+      const lc = stripEmpty(this.ossConfig.llm.config ?? {});
+      config.llm = {
+        provider: this.ossConfig.llm.provider || defaultLlm.provider,
+        config: { ...defaultLlm.config, ...lc },
+      };
+    } else {
+      config.llm = defaultLlm;
+    }
+
+    if (this.ossConfig?.vectorStore)
+      config.vectorStore = this.ossConfig.vectorStore;
 
     if (this.ossConfig?.historyDbPath) {
       const dbPath = this.resolvePath
@@ -423,9 +298,15 @@ class OSSProvider implements Mem0Provider {
       config.disableHistory = true;
     }
 
+    if (this.customPrompt) config.customPrompt = this.customPrompt;
+
     try {
       this.memory = new Memory(config);
     } catch (err) {
+      // If initialization fails (e.g. native SQLite binding resolution under
+      // jiti), retry with history disabled — the history DB is the most common
+      // source of native-binding failures and is not required for core
+      // memory operations.
       if (!config.disableHistory) {
         console.warn(
           "[mem0] Memory initialization failed, retrying with history disabled:",
@@ -437,105 +318,128 @@ class OSSProvider implements Mem0Provider {
         throw err;
       }
     }
+
+    // Force the SDK's internal auto-initialization to complete now.
+    // Without this, concurrent method calls (e.g. auto-recall + search)
+    // both trigger _autoInitialize() simultaneously, causing PGVector's
+    // pg client to call connect() twice → "Client has already been
+    // connected" crash. (#4638)
+    try {
+      await this.memory.getAll({ userId: "__mem0_warmup__" });
+    } catch {
+      // Warmup errors are non-fatal — the SDK may still work for
+      // subsequent calls once its internal state settles.
+    }
   }
 
-  private scopeToOSSParams(scope: ScopeFilter): Record<string, unknown> {
-    const params: Record<string, unknown> = {};
-    if (scope.userId) params.userId = scope.userId;
-    if (scope.sessionId) params.runId = scope.sessionId;
-    return params;
-  }
-
-  async add(request: StoreRequest): Promise<StoreResult> {
+  async add(
+    messages: Array<{ role: string; content: string }>,
+    options: AddOptions,
+  ): Promise<AddResult> {
     await this.ensureMemory();
+    // OSS SDK uses camelCase: userId/runId, not user_id/run_id
+    const addOpts: Record<string, unknown> = { userId: options.user_id };
+    if (options.run_id) addOpts.runId = options.run_id;
+    if (options.source) addOpts.source = options.source;
+    // Agentic harness: direct storage bypass
+    if (options.infer !== undefined) addOpts.infer = options.infer;
+    if (options.metadata) addOpts.metadata = options.metadata;
+    if (options.expiration_date)
+      addOpts.expirationDate = options.expiration_date;
+    if (options.immutable) addOpts.immutable = options.immutable;
 
-    const params = this.scopeToOSSParams(request.scope);
-    const results: Array<{ id: string; memory: string; event: "ADD" | "UPDATE" | "DELETE" | "NOOP" }> = [];
+    // OSS SDK doesn't support deduced_memories — when infer=false, it stores
+    // raw message content directly. Rewrite messages to contain the facts so
+    // OSS stores the right text.
+    let effectiveMessages = messages;
+    if (options.infer === false && options.deduced_memories?.length) {
+      effectiveMessages = options.deduced_memories.map((fact) => ({
+        role: "user",
+        content: fact,
+      }));
+    }
 
-    for (const fact of request.facts) {
-      const result = await this.memory.add(
-        [{ role: "user", content: fact }],
-        params
+    const result = await this.memory.add(effectiveMessages, addOpts);
+    return normalizeAddResult(result);
+  }
+
+  async search(query: string, options: SearchOptions): Promise<MemoryItem[]> {
+    await this.ensureMemory();
+    // OSS SDK uses camelCase: userId/runId, not user_id/run_id
+    const opts: Record<string, unknown> = { userId: options.user_id };
+    if (options.run_id) opts.runId = options.run_id;
+    if (options.limit != null) opts.limit = options.limit;
+    else if (options.top_k != null) opts.limit = options.top_k;
+    if (options.keyword_search != null)
+      opts.keyword_search = options.keyword_search;
+    if (options.reranking != null) opts.reranking = options.reranking;
+    if (options.source) opts.source = options.source;
+    if (options.threshold != null) opts.threshold = options.threshold;
+
+    const results = await this.memory.search(query, opts);
+    const normalized = normalizeSearchResults(results);
+
+    // Filter results by threshold if specified (client-side filtering as fallback)
+    if (options.threshold != null) {
+      return normalized.filter(
+        (item) => (item.score ?? 0) >= options.threshold!,
       );
-
-      if (result?.results) {
-        for (const r of result.results) {
-          results.push({
-            id: r.id ?? "",
-            memory: r.memory ?? fact,
-            event: r.event ?? "ADD",
-          });
-        }
-      }
     }
 
-    return { results };
+    return normalized;
   }
 
-  async search(request: SearchRequest): Promise<SearchResult> {
+  async get(memoryId: string): Promise<MemoryItem> {
     await this.ensureMemory();
-
-    const params: Record<string, unknown> = this.scopeToOSSParams(request.scope);
-    if (request.options?.limit) params.limit = request.options.limit;
-    if (request.options?.threshold) params.threshold = request.options.threshold;
-
-    const results = await this.memory.search(request.query, params);
-    let items = normalizeSearchResults(results);
-
-    // Client-side threshold filtering
-    if (request.options?.threshold) {
-      items = items.filter(item => (item.score ?? 0) >= request.options!.threshold!);
-    }
-
-    return { results: items };
-  }
-
-  async get(id: string): Promise<MemoryItem> {
-    await this.ensureMemory();
-    const result = await this.memory.get(id);
+    const result = await this.memory.get(memoryId);
     return normalizeMemoryItem(result);
   }
 
-  async update(id: string, data: { text: string; metadata?: Record<string, unknown> }): Promise<void> {
+  async getAll(options: ListOptions): Promise<MemoryItem[]> {
     await this.ensureMemory();
-    await this.memory.update(id, { data: data.text, metadata: data.metadata });
-  }
-
-  async delete(id: string): Promise<void> {
-    await this.ensureMemory();
-    await this.memory.delete(id);
-  }
-
-  async list(request: ListRequest): Promise<MemoryItem[]> {
-    await this.ensureMemory();
-
-    const params = this.scopeToOSSParams(request.scope);
-    if (request.limit) params.limit = request.limit;
-
-    const results = await this.memory.getAll(params);
+    // OSS SDK uses camelCase: userId/runId, not user_id/run_id
+    const getAllOpts: Record<string, unknown> = { userId: options.user_id };
+    if (options.run_id) getAllOpts.runId = options.run_id;
+    if (options.source) getAllOpts.source = options.source;
+    const results = await this.memory.getAll(getAllOpts);
     if (Array.isArray(results)) return results.map(normalizeMemoryItem);
-    if (results?.results) return results.results.map(normalizeMemoryItem);
+    if (results?.results && Array.isArray(results.results))
+      return results.results.map(normalizeMemoryItem);
     return [];
   }
 
-  async deleteAll(scope: ScopeFilter): Promise<void> {
+  async update(memoryId: string, text: string): Promise<void> {
     await this.ensureMemory();
-    const params = this.scopeToOSSParams(scope);
-    await this.memory.deleteAll(params);
+    await this.memory.update(memoryId, text);
   }
 
-  async history(id: string): Promise<HistoryEntry[]> {
+  async delete(memoryId: string): Promise<void> {
+    await this.ensureMemory();
+    await this.memory.delete(memoryId);
+  }
+
+  async deleteAll(userId: string): Promise<void> {
+    await this.ensureMemory();
+    await this.memory.deleteAll({ userId });
+  }
+
+  async history(
+    memoryId: string,
+  ): Promise<
+    Array<{
+      id: string;
+      old_memory: string;
+      new_memory: string;
+      event: string;
+      created_at: string;
+    }>
+  > {
     await this.ensureMemory();
     try {
-      const result = await this.memory.history(id);
-      return Array.isArray(result) ? result.map((h: any) => ({
-        id: h.id,
-        oldMemory: h.old_memory,
-        newMemory: h.new_memory,
-        event: h.event,
-        createdAt: h.created_at,
-      })) : [];
+      const result = await this.memory.history(memoryId);
+      return Array.isArray(result) ? result : [];
     } catch {
+      // OSS may not support history depending on config
       return [];
     }
   }
@@ -548,21 +452,111 @@ class OSSProvider implements Mem0Provider {
 export function createProvider(
   cfg: Mem0Config,
   api: OpenClawPluginApi,
-): { provider: Mem0Provider; auditLogger: AuditLogger; conversationManager: ConversationMemoryManager } {
-  const auditDbPath = cfg.oss?.historyDbPath
-    ? api.resolvePath(cfg.oss.historyDbPath)
-    : undefined;
-
-  const auditLogger = new AuditLogger(auditDbPath, cfg.features.auditLog);
-  const conversationManager = new ConversationMemoryManager();
-
-  let provider: Mem0Provider;
-
+): Mem0Provider {
   if (cfg.mode === "open-source") {
-    provider = new OSSProvider(cfg.oss, (p) => api.resolvePath(p));
-  } else {
-    provider = new PlatformProvider(cfg.apiKey!, cfg.projectId);
+    return new OSSProvider(cfg.oss, cfg.customPrompt, (p) =>
+      api.resolvePath(p),
+    );
   }
 
-  return { provider, auditLogger, conversationManager };
+  return new PlatformProvider(cfg.apiKey!, cfg.baseUrl, cfg.orgId, cfg.projectId);
+}
+
+// ============================================================================
+// Provider-to-Backend Adapter
+// ============================================================================
+
+import type { Backend } from "./backend/base.ts";
+
+/**
+ * Wraps an existing Mem0Provider as the Backend interface.
+ * Used in OSS mode where PlatformBackend cannot be used.
+ * Platform-only methods (entities, events) throw clear errors.
+ */
+export function providerToBackend(
+  provider: Mem0Provider,
+  userId: string,
+): Backend {
+  return {
+    async add(content, messages, opts = {}) {
+      const msgs = messages ?? (content ? [{ role: "user", content }] : []);
+      const result = await provider.add(
+        msgs as Array<{ role: string; content: string }>,
+        {
+          user_id: opts.userId ?? userId,
+          ...(opts.runId && { run_id: opts.runId }),
+          ...(opts.metadata && { metadata: opts.metadata }),
+          ...(opts.immutable && { immutable: true }),
+          ...(opts.infer === false && { infer: false }),
+          ...(opts.expires && { expiration_date: opts.expires }),
+          ...(opts.enableGraph && { enable_graph: true }),
+        },
+      );
+      return result as unknown as Record<string, unknown>;
+    },
+
+    async search(query, opts = {}) {
+      const results = await provider.search(query, {
+        user_id: opts.userId ?? userId,
+        top_k: opts.topK,
+        threshold: opts.threshold,
+        keyword_search: opts.keyword,
+        reranking: opts.rerank,
+        filters: opts.filters,
+      });
+      return results as unknown as Record<string, unknown>[];
+    },
+
+    async get(memoryId) {
+      const item = await provider.get(memoryId);
+      return item as unknown as Record<string, unknown>;
+    },
+
+    async listMemories(opts = {}) {
+      const items = await provider.getAll({
+        user_id: opts.userId ?? userId,
+        page_size: opts.pageSize,
+      });
+      return items as unknown as Record<string, unknown>[];
+    },
+
+    async update(memoryId, content, metadata) {
+      if (content) await provider.update(memoryId, content);
+      if (metadata) {
+        // OSS provider doesn't support metadata-only updates — log warning
+        console.warn(
+          "providerToBackend: metadata updates are not supported in OSS mode, only text updates are applied",
+        );
+      }
+      return { id: memoryId, updated: true };
+    },
+
+    async delete(memoryId, opts = {}) {
+      if (opts.all) {
+        await provider.deleteAll(opts.userId ?? userId);
+        return { deleted: "all" };
+      }
+      if (memoryId) {
+        await provider.delete(memoryId);
+        return { deleted: memoryId };
+      }
+      throw new Error("Either memoryId or all is required");
+    },
+
+    async deleteEntities() {
+      throw new Error("Entity management is only available in platform mode.");
+    },
+    async status() {
+      return { connected: true, backend: "oss" };
+    },
+    async entities() {
+      throw new Error("Entity management is only available in platform mode.");
+    },
+    async listEvents() {
+      throw new Error("Event management is only available in platform mode.");
+    },
+    async getEvent() {
+      throw new Error("Event management is only available in platform mode.");
+    },
+  };
 }

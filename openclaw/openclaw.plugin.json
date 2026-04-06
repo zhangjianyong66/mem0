@@ -1,7 +1,20 @@
 {
   "id": "openclaw-mem0",
+  "name": "Memory (Mem0)",
+  "description": "Mem0 memory backend for OpenClaw — platform or self-hosted open-source",
   "kind": "memory",
   "skills": ["skills"],
+  "contracts": {
+    "tools": [
+      "memory_search", "memory_add", "memory_get", "memory_list",
+      "memory_update", "memory_delete", "memory_event_list", "memory_event_status"
+    ]
+  },
+  "providerAuthEnvVars": {
+    "mem0": ["MEM0_API_KEY"],
+    "mem0-oss-openai": ["OPENAI_API_KEY"],
+    "mem0-oss-anthropic": ["ANTHROPIC_API_KEY"]
+  },
   "uiHints": {
     "mode": {
       "label": "Mode",
@@ -11,54 +24,30 @@
       "label": "Mem0 API Key",
       "sensitive": true,
       "placeholder": "m0-...",
-      "help": "API key from app.mem0.ai (or use ${MEM0_API_KEY}). Required for platform mode."
+      "help": "Platform mode only. Use a SecretRef ({\"source\":\"env\",\"provider\":\"default\",\"id\":\"MEM0_API_KEY\"}) or ${MEM0_API_KEY} instead of storing the key directly."
     },
-    "defaultScope": {
-      "label": "Default Scope",
-      "help": "Required: userId for scoping memories. Optional: orgId/appId for organization scope."
+    "userId": {
+      "label": "Default User ID",
+      "placeholder": "default",
+      "help": "User ID for scoping memories"
     },
-    "defaultScope.userId": {
-      "label": "User ID",
-      "placeholder": "alice",
-      "help": "Required. Any unique identifier for the user (e.g. 'alice', 'user_123')"
-    },
-    "defaultScope.orgId": {
+    "orgId": {
       "label": "Organization ID",
-      "placeholder": "acme",
-      "advanced": true,
-      "help": "Optional. Organization ID for shared memories."
-    },
-    "defaultScope.appId": {
-      "label": "Application ID",
-      "placeholder": "my-app",
-      "advanced": true,
-      "help": "Optional. Application ID for app-specific memories."
-    },
-    "features": {
-      "label": "Features",
-      "help": "Toggle plugin features: autoRecall, autoCapture, auditLog, graph"
-    },
-    "features.autoRecall": {
-      "label": "Auto-Recall",
-      "help": "Automatically inject relevant memories before each agent turn (default: true)"
-    },
-    "features.autoCapture": {
-      "label": "Auto-Capture",
-      "help": "Automatically store conversation context after each agent turn (default: true)"
-    },
-    "features.auditLog": {
-      "label": "Audit Log",
-      "help": "Record all memory operations to SQLite audit log (default: false)"
-    },
-    "features.graph": {
-      "label": "Graph Memory",
-      "help": "Enable Mem0 graph memory for entity relationships (platform mode only, default: false)"
+      "placeholder": "org-...",
+      "advanced": true
     },
     "projectId": {
       "label": "Project ID",
       "placeholder": "proj-...",
-      "advanced": true,
-      "help": "Project ID for platform mode"
+      "advanced": true
+    },
+    "autoCapture": {
+      "label": "Auto-Capture",
+      "help": "Automatically store conversation context after each agent turn"
+    },
+    "autoRecall": {
+      "label": "Auto-Recall",
+      "help": "Automatically inject relevant memories before each agent turn"
     },
     "customInstructions": {
       "label": "Custom Instructions",
@@ -68,7 +57,16 @@
     "customCategories": {
       "label": "Custom Categories",
       "advanced": true,
-      "help": "Map of category names to descriptions for memory tagging (platform mode). Sensible defaults are built in."
+      "help": "Map of category names to descriptions for memory tagging (platform mode only). Sensible defaults are built in."
+    },
+    "customPrompt": {
+      "label": "Custom Prompt (Open-Source)",
+      "advanced": true,
+      "help": "Custom prompt for open-source mode memory extraction."
+    },
+    "enableGraph": {
+      "label": "Enable Graph Memory",
+      "help": "Enable Mem0 graph memory for entity relationships (platform mode only)"
     },
     "searchThreshold": {
       "label": "Search Threshold",
@@ -78,26 +76,17 @@
     "topK": {
       "label": "Top K Results",
       "placeholder": "5",
-      "help": "Maximum number of memories to retrieve per recall. Default: 5"
+      "help": "Maximum number of memories to retrieve"
     },
     "oss": {
       "label": "Open-Source Configuration",
       "advanced": true,
-      "help": "Configure embedder, vector store, LLM, history DB for open-source mode. Has sensible defaults."
-    },
-    "oss.historyDbPath": {
-      "label": "History DB Path",
-      "placeholder": "./data/mem0_history.db",
-      "help": "SQLite path for memory edit history and audit log"
-    },
-    "oss.disableHistory": {
-      "label": "Disable History",
-      "help": "Skip history DB initialization (useful when SQLite bindings fail)"
+      "help": "Optional. Configure custom embedder, vector store, LLM, or history DB for open-source mode. For API keys in sub-provider configs, use SecretRef objects or ${VAR} syntax instead of plaintext values."
     },
     "skills": {
       "label": "Agentic Memory Skills",
       "advanced": true,
-      "help": "Enable skills-based memory extraction. Disables auto-capture when active."
+      "help": "Enable skills-based memory extraction. The agent controls what to remember (triage), how to recall (recall), and periodic cleanup (dream). Disables auto-capture when active."
     }
   },
   "configSchema": {
@@ -106,59 +95,31 @@
     "properties": {
       "mode": {
         "type": "string",
-        "enum": ["platform", "open-source", "oss"],
-        "default": "platform"
+        "enum": [
+          "platform",
+          "open-source"
+        ]
       },
       "apiKey": {
+        "type": "string"
+      },
+      "userId": {
+        "type": "string"
+      },
+      "userEmail": {
+        "type": "string"
+      },
+      "orgId": {
         "type": "string"
       },
       "projectId": {
         "type": "string"
       },
-      "defaultScope": {
-        "type": "object",
-        "properties": {
-          "userId": {
-            "type": "string",
-            "description": "Required. Unique identifier for the user"
-          },
-          "orgId": {
-            "type": "string",
-            "description": "Optional. Organization ID for shared memories"
-          },
-          "appId": {
-            "type": "string",
-            "description": "Optional. Application ID for app-specific memories"
-          }
-        },
-        "required": ["userId"]
+      "autoCapture": {
+        "type": "boolean"
       },
-      "features": {
-        "type": "object",
-        "properties": {
-          "autoRecall": {
-            "type": "boolean",
-            "default": true
-          },
-          "autoCapture": {
-            "type": "boolean",
-            "default": true
-          },
-          "auditLog": {
-            "type": "boolean",
-            "default": false
-          },
-          "graph": {
-            "type": "boolean",
-            "default": false
-          }
-        },
-        "default": {
-          "autoRecall": true,
-          "autoCapture": true,
-          "auditLog": false,
-          "graph": false
-        }
+      "autoRecall": {
+        "type": "boolean"
       },
       "customInstructions": {
         "type": "string"
@@ -169,13 +130,17 @@
           "type": "string"
         }
       },
+      "customPrompt": {
+        "type": "string"
+      },
+      "enableGraph": {
+        "type": "boolean"
+      },
       "searchThreshold": {
-        "type": "number",
-        "default": 0.5
+        "type": "number"
       },
       "topK": {
-        "type": "number",
-        "default": 5
+        "type": "number"
       },
       "oss": {
         "type": "object",
@@ -183,29 +148,38 @@
           "embedder": {
             "type": "object",
             "properties": {
-              "provider": { "type": "string" },
-              "config": { "type": "object" }
+              "provider": {
+                "type": "string"
+              },
+              "config": {
+                "type": "object"
+              }
             }
           },
           "vectorStore": {
             "type": "object",
             "properties": {
-              "provider": { "type": "string" },
-              "config": { "type": "object" }
+              "provider": {
+                "type": "string"
+              },
+              "config": {
+                "type": "object"
+              }
             }
           },
           "llm": {
             "type": "object",
             "properties": {
-              "provider": { "type": "string" },
-              "config": { "type": "object" }
+              "provider": {
+                "type": "string"
+              },
+              "config": {
+                "type": "object"
+              }
             }
           },
           "historyDbPath": {
             "type": "string"
-          },
-          "disableHistory": {
-            "type": "boolean"
           }
         }
       },
@@ -240,12 +214,10 @@
             "type": "object",
             "properties": {
               "enabled": { "type": "boolean" },
-              "schedule": { "type": "string" },
-              "mergeThreshold": { "type": "number" },
-              "maxMemoriesPerUser": { "type": "number" },
-              "preserveImmutable": { "type": "boolean" },
-              "credentialScan": { "type": "boolean" },
-              "expireStaleAfterDays": { "type": "number" }
+              "auto": { "type": "boolean" },
+              "minHours": { "type": "number" },
+              "minSessions": { "type": "number" },
+              "minMemories": { "type": "number" }
             }
           },
           "domain": { "type": "string" },
@@ -260,6 +232,6 @@
         }
       }
     },
-    "required": ["defaultScope"]
+    "required": []
   }
 }
