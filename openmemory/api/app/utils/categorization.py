@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import List
 
 from app.utils.prompts import MEMORY_CATEGORIZATION_PROMPT
@@ -8,7 +9,19 @@ from pydantic import BaseModel
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 load_dotenv()
-openai_client = OpenAI()
+
+# Lazy initialization of OpenAI client
+_openai_client = None
+
+def _get_openai_client():
+    global _openai_client
+    if _openai_client is None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            logging.warning("OPENAI_API_KEY not set, categorization will not work")
+            return None
+        _openai_client = OpenAI(api_key=api_key)
+    return _openai_client
 
 
 class MemoryCategories(BaseModel):
@@ -18,13 +31,18 @@ class MemoryCategories(BaseModel):
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=15))
 def get_categories_for_memory(memory: str) -> List[str]:
     try:
+        client = _get_openai_client()
+        if client is None:
+            logging.warning("OpenAI client not available, returning empty categories")
+            return []
+        
         messages = [
             {"role": "system", "content": MEMORY_CATEGORIZATION_PROMPT},
             {"role": "user", "content": memory}
         ]
 
         # Let OpenAI handle the pydantic parsing directly
-        completion = openai_client.beta.chat.completions.parse(
+        completion = client.beta.chat.completions.parse(
             model="gpt-4o-mini",
             messages=messages,
             response_format=MemoryCategories,
