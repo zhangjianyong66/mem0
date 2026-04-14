@@ -22,6 +22,7 @@ export interface ToolDeps {
   buildAddOptions: (userIdOverride?: string, runId?: string, sessionKey?: string) => AddOptions;
   buildSearchOptions: (userIdOverride?: string, limit?: number, runId?: string, sessionKey?: string) => SearchOptions;
   getCurrentSessionId: () => string | undefined;
+  getStateDir: () => string | undefined;
   skillsActive: boolean;
   captureToolEvent: (toolName: string, properties: Record<string, unknown>) => void;
 }

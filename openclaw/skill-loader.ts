@@ -328,10 +328,17 @@ export function loadTriagePrompt(config: SkillsConfig = {}): string {
     parts.push(
       "Batch facts by CATEGORY. All facts in one memory_add call must share the same category because category determines retention policy (TTL, immutability). If a turn has facts in different categories, make one call per category.",
     );
+    parts.push(
+      "When a fact belongs to a recurring entity or topic, include stable metadata keys so future recall and consolidation can deduplicate correctly. Reuse the same `topicKey` and `entityKey` whenever you are talking about the same project, person, rule, or configuration thread.",
+    );
     parts.push("");
     parts.push("FORMAT (single category):");
     parts.push(
       '  memory_add(facts: ["User is Alex, backend engineer at Stripe, PST timezone"], category: "identity")',
+    );
+    parts.push("FORMAT (single category with metadata for dedupe):");
+    parts.push(
+      '  memory_add(facts: ["As of 2026-04-01, user is migrating from Postgres to CockroachDB"], category: "decision", metadata: { topicKey: "project:db-migration", entityKey: "project:db-migration", temporalScope: "ongoing", sourceKind: "decision" })',
     );
     parts.push("FORMAT (mixed categories in one turn, separate calls):");
     parts.push(

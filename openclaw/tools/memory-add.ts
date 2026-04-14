@@ -2,6 +2,8 @@ import { Type } from "@sinclair/typebox";
 import type { AddOptions } from "../types.ts";
 import { isSubagentSession } from "../isolation.ts";
 import { resolveCategories, ttlToExpirationDate } from "../skill-loader.ts";
+import { buildStableMemoryMetadata } from "./memory-metadata.ts";
+import { planMemoryWrite } from "./memory-dedupe.ts";
 import type { ToolDeps } from "./index.ts";
 
 export function createMemoryAddTool(deps: ToolDeps) {
@@ -48,8 +50,14 @@ export function createMemoryAddTool(deps: ToolDeps) {
           const rawMetadata = p.metadata;
           const category = p.category ?? rawMetadata?.category as string | undefined;
           const importance = p.importance ?? rawMetadata?.importance as number | undefined;
+          const stableMetadata = buildStableMemoryMetadata(
+            allFacts,
+            category,
+            rawMetadata,
+          );
           const parsedMetadata: Record<string, unknown> = {
             ...(rawMetadata ?? {}),
+            ...stableMetadata,
             ...(category && { category }),
             ...(importance !== undefined && { importance }),
           };
@@ -69,14 +77,133 @@ export function createMemoryAddTool(deps: ToolDeps) {
             addOpts.output_format = "v1.1";
           }
 
+          const dedupeSearchOptions = {
+            user_id: uid,
+            top_k: 5,
+            threshold: 0.55,
+            filter_memories: true,
+            source: "OPENCLAW",
+            ...(category && { categories: [category] }),
+          };
+          const writePlan = await planMemoryWrite({
+            provider,
+            text: allFacts.join(" "),
+            category,
+            metadata: parsedMetadata,
+            searchOptions: dedupeSearchOptions,
+            stateDir: deps.getStateDir(),
+          });
+
+          if (writePlan.action === "noop") {
+            api.logger.info(
+              `openclaw-mem0: skipped duplicate memory write (category=${category ?? "none"}, reason=${writePlan.reason})`,
+            );
+            deps.captureToolEvent("memory_add", {
+              success: true,
+              latency_ms: Date.now() - start,
+              fact_count: allFacts.length,
+              mode: "skills",
+              dedup_applied: true,
+              dedup_action: "noop",
+              dedup_reason: writePlan.reason,
+              candidate_count: writePlan.candidateCount,
+              target_memory_id: writePlan.target?.id,
+              feedback_applied: writePlan.feedbackApplied,
+              feedback_topic_hit: writePlan.feedbackTopicHit,
+              dynamic_threshold_delta: writePlan.dynamicThresholdDelta,
+            });
+            return {
+              content: [{
+                type: "text",
+                text: `Skipped duplicate memory [${category ?? "uncategorized"}]: "${writePlan.target?.memory?.slice(0, 80) ?? allFacts.join(" ").slice(0, 80)}${(writePlan.target?.memory?.length ?? allFacts.join(" ").length) > 80 ? "..." : ""}"`,
+              }],
+              details: {
+                action: "skipped",
+                mode: "skills",
+                category,
+                factCount: allFacts.length,
+                reason: writePlan.reason,
+                candidateCount: writePlan.candidateCount,
+                targetMemoryId: writePlan.target?.id,
+                feedbackApplied: writePlan.feedbackApplied,
+                feedbackTopicHit: writePlan.feedbackTopicHit,
+                dynamicThresholdDelta: writePlan.dynamicThresholdDelta,
+              },
+            };
+          }
+
+          if (writePlan.action === "update" && writePlan.target?.id) {
+            await provider.update(writePlan.target.id, writePlan.text);
+            api.logger.info(
+              `openclaw-mem0: updated existing memory ${writePlan.target.id} (category=${category ?? "none"})`,
+            );
+            deps.captureToolEvent("memory_add", {
+              success: true,
+              latency_ms: Date.now() - start,
+              fact_count: allFacts.length,
+              mode: "skills",
+              dedup_applied: true,
+              dedup_action: "update",
+              dedup_reason: writePlan.reason,
+              candidate_count: writePlan.candidateCount,
+              target_memory_id: writePlan.target.id,
+              feedback_applied: writePlan.feedbackApplied,
+              feedback_topic_hit: writePlan.feedbackTopicHit,
+              dynamic_threshold_delta: writePlan.dynamicThresholdDelta,
+            });
+            return {
+              content: [{
+                type: "text",
+                text: `Updated memory ${writePlan.target.id} [${category ?? "uncategorized"}]: "${writePlan.text.slice(0, 80)}${writePlan.text.length > 80 ? "..." : ""}"`,
+              }],
+              details: {
+                action: "updated",
+                mode: "skills",
+                category,
+                factCount: allFacts.length,
+                reason: writePlan.reason,
+                candidateCount: writePlan.candidateCount,
+                targetMemoryId: writePlan.target.id,
+                feedbackApplied: writePlan.feedbackApplied,
+                feedbackTopicHit: writePlan.feedbackTopicHit,
+                dynamicThresholdDelta: writePlan.dynamicThresholdDelta,
+              },
+            };
+          }
+
           const result = await provider.add([{ role: "user", content: allFacts.join("\n") }], addOpts);
           const count = result.results?.length ?? 0;
           api.logger.info(`openclaw-mem0: stored ${count} memor${count === 1 ? "y" : "ies"} (infer=false, category=${category ?? "none"})`);
 
-          deps.captureToolEvent("memory_add", { success: true, latency_ms: Date.now() - start, fact_count: allFacts.length, mode: "skills" });
+          deps.captureToolEvent("memory_add", {
+            success: true,
+            latency_ms: Date.now() - start,
+            fact_count: allFacts.length,
+            mode: "skills",
+            dedup_applied: true,
+            dedup_action: "add",
+            dedup_reason: writePlan.reason,
+            candidate_count: writePlan.candidateCount,
+            target_memory_id: writePlan.target?.id,
+            feedback_applied: writePlan.feedbackApplied,
+            feedback_topic_hit: writePlan.feedbackTopicHit,
+            dynamic_threshold_delta: writePlan.dynamicThresholdDelta,
+          });
           return {
             content: [{ type: "text", text: `Stored ${allFacts.length} fact(s) [${category ?? "uncategorized"}]: ${allFacts.map(f => `"${f.slice(0, 60)}${f.length > 60 ? "..." : ""}"`).join(", ")}` }],
-            details: { action: "stored", mode: "skills", category, factCount: allFacts.length, results: result.results },
+            details: {
+              action: "added",
+              mode: "skills",
+              category,
+              factCount: allFacts.length,
+              reason: writePlan.reason,
+              candidateCount: writePlan.candidateCount,
+              targetMemoryId: writePlan.target?.id,
+              feedbackApplied: writePlan.feedbackApplied,
+              feedbackTopicHit: writePlan.feedbackTopicHit,
+              dynamicThresholdDelta: writePlan.dynamicThresholdDelta,
+              results: result.results,
+            },
           };
         }
 

@@ -20,10 +20,10 @@ Follow these four phases in order. Do not skip phases.
 
 Survey the current memory landscape before making any changes.
 
-1. Call `memory_list` to load all stored memories.
-2. Count memories by category. Note the total.
-3. Identify the oldest and newest memories by their timestamps.
-4. Note any obvious problems visible in the list: duplicates, very short entries, entries without temporal anchors.
+1. Read the provided `<dream-summary>` and `<memory-groups>` sections first. Treat them as the primary inventory and prioritization input.
+2. Use `<memory-groups>` to identify likely duplicate clusters, delete candidates, rewrite candidates, and stale memories.
+3. Use `memory_list` only if you need to verify the broader inventory or confirm counts/timestamps that are unclear from the provided context.
+4. Use `memory_search` only when you need to inspect a suspicious cluster in more detail before changing it.
 
 Do not modify anything in this phase. The goal is to understand what you are working with.
 
@@ -31,8 +31,11 @@ Do not modify anything in this phase. The goal is to understand what you are wor
 
 Identify which memories need action. Use the tools to investigate.
 
-**Search for recent additions:**
-Call `memory_search` with a `created_at` filter to find memories added since the last consolidation. These are the most likely to need merging or cleanup.
+**Start from grouped candidates:**
+Review the groups already provided. They are pre-clustered by topic/entity/category similarity and annotated with candidate actions.
+
+**Then verify only where needed:**
+Use `memory_search` or `memory_list` selectively to inspect edge cases, confirm recency, or validate ambiguous groups before writing.
 
 **Classify each target into one of these actions:**
 - DELETE: contains credentials, expired by TTL, pure noise, raw tool output, standalone timestamps

@@ -87,11 +87,21 @@ export interface SkillsConfig {
     strategy?: "always" | "smart" | "manual";
     tokenBudget?: number;
     maxMemories?: number;
+    rawTopK?: number;
+    finalMaxMemories?: number;
     rerank?: boolean;
     keywordSearch?: boolean;
     filterMemories?: boolean;
     threshold?: number;
+    relativeScoreThreshold?: number;
     identityAlwaysInclude?: boolean;
+    identityMode?: "always" | "on-demand" | "never";
+    gateEnabled?: boolean;
+    shortQueryChars?: number;
+    continuationPatterns?: string[];
+    historyPatterns?: string[];
+    dedupeEnabled?: boolean;
+    summaryEnabled?: boolean;
     categoryOrder?: string[];
   };
   dream?: {

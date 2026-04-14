@@ -110,6 +110,9 @@
       "userEmail": {
         "type": "string"
       },
+      "anonymousTelemetryId": {
+        "type": "string"
+      },
       "autoCapture": {
         "type": "boolean"
       },
@@ -193,11 +196,21 @@
               "strategy": { "type": "string", "enum": ["always", "smart", "manual"] },
               "tokenBudget": { "type": "number" },
               "maxMemories": { "type": "number" },
+              "rawTopK": { "type": "number" },
+              "finalMaxMemories": { "type": "number" },
               "rerank": { "type": "boolean" },
               "keywordSearch": { "type": "boolean" },
               "filterMemories": { "type": "boolean" },
               "threshold": { "type": "number" },
+              "relativeScoreThreshold": { "type": "number" },
               "identityAlwaysInclude": { "type": "boolean" },
+              "identityMode": { "type": "string", "enum": ["always", "on-demand", "never"] },
+              "gateEnabled": { "type": "boolean" },
+              "shortQueryChars": { "type": "number" },
+              "continuationPatterns": { "type": "array", "items": { "type": "string" } },
+              "historyPatterns": { "type": "array", "items": { "type": "string" } },
+              "dedupeEnabled": { "type": "boolean" },
+              "summaryEnabled": { "type": "boolean" },
               "categoryOrder": { "type": "array", "items": { "type": "string" } }
             }
           },

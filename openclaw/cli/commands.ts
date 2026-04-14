@@ -37,6 +37,12 @@ import type {
   SearchOptions,
 } from "../types.ts";
 import { loadDreamPrompt } from "../skill-loader.ts";
+import {
+  analyzeMemoryInventory,
+  formatDreamGroups,
+  formatDreamSummary,
+} from "../dream-analyzer.ts";
+import { readDreamFeedbackState } from "../dream-feedback.ts";
 import { readText } from "../fs-safe.ts";
 import type { PluginAuthConfig } from "./config-file.ts";
 import {
@@ -241,6 +247,7 @@ export function registerCliCommands(
     sessionKey?: string,
   ) => SearchOptions,
   getCurrentSessionId: () => string | undefined,
+  getStateDir?: () => string | undefined,
   captureCliEvent?: (command: string) => void,
 ): void {
   api.registerCli(
@@ -1341,6 +1348,7 @@ export function registerCliCommands(
               status: "Check connectivity and authentication",
               config: "Manage mem0 configuration (show, get, set)",
               event: "Manage background processing events (list, status)",
+              feedback: "Show local dream-feedback tuning and recent consolidation outcomes",
               dream: "Run memory consolidation (review, merge, prune)",
               help: "Show help. Use --json for machine-readable output (for LLM agents)",
             },
@@ -1364,6 +1372,44 @@ export function registerCliCommands(
             console.log(`    ${cmd.padEnd(12)} ${desc}`);
           }
           console.log("");
+        });
+
+      mem0
+        .command("feedback")
+        .description("Show local dream-feedback tuning and recent consolidation outcomes")
+        .action(() => {
+          try {
+            const stateDir = getStateDir?.();
+            if (!stateDir) {
+              console.log("Dream feedback state is not available (no local stateDir).");
+              return;
+            }
+
+            const state = readDreamFeedbackState(stateDir);
+            const topicEntries = Object.entries(state.topicOutcomes)
+              .sort((a, b) => b[1].lastUpdatedAt - a[1].lastUpdatedAt)
+              .slice(0, 5);
+
+            console.log(`Last Updated: ${state.lastUpdatedAt ? new Date(state.lastUpdatedAt).toISOString() : "never"}`);
+            console.log(`Recent Dream Runs: ${state.recentDreamRuns.length}`);
+            console.log(`Tracked Topics: ${Object.keys(state.topicOutcomes).length}`);
+            console.log(`Tracked Memory IDs: ${Object.keys(state.writeOutcomeByMemoryId).length}`);
+
+            if (topicEntries.length === 0) {
+              console.log("\nNo dream feedback recorded yet.");
+              return;
+            }
+
+            console.log("\nTop Feedback Topics:");
+            for (const [topicKey, outcome] of topicEntries) {
+              const tuning = state.dedupeTuning[topicKey];
+              console.log(
+                `  ${topicKey}  merge=${outcome.mergeFixups} delete=${outcome.duplicateDeletes} replace=${outcome.consolidatedReplacements} delta=${((tuning?.duplicateDeleteBias ?? 0) + (tuning?.mergeFixupBias ?? 0) + (tuning?.rewriteFixupBias ?? 0) + (tuning?.consolidatedReplacementBias ?? 0)).toFixed(2)}`,
+              );
+            }
+          } catch (err) {
+            console.error(`Failed to read dream feedback: ${String(err)}`);
+          }
         });
 
       // ====================================================================
@@ -1401,6 +1447,12 @@ export function registerCliCommands(
                 "uncategorized";
               catCounts.set(cat, (catCounts.get(cat) ?? 0) + 1);
             }
+            const feedbackState = readDreamFeedbackState(getStateDir?.());
+            const analysis = analyzeMemoryInventory(
+              memories as MemoryItem[],
+              new Date(),
+              feedbackState,
+            );
             process.stderr.write(`\nMemory inventory for "${uid}":\n`);
             for (const [cat, num] of [...catCounts.entries()].sort(
               (a, b) => b[1] - a[1],
@@ -1410,6 +1462,31 @@ export function registerCliCommands(
             process.stderr.write(`  TOTAL: ${count}\n\n`);
 
             if (opts.dryRun) {
+              process.stderr.write(
+                `  GROUPS: ${analysis.groupCount}\n` +
+                `  MERGE CANDIDATE GROUPS: ${analysis.mergeCandidateGroups}\n` +
+                `  REWRITE CANDIDATES: ${analysis.rewriteCandidateCount}\n` +
+                `  DELETE CANDIDATES: ${analysis.deleteCandidateCount}\n` +
+                `  STALE CANDIDATES: ${analysis.staleCandidateCount}\n` +
+                `  FEEDBACK PRIORITY GROUPS: ${analysis.feedbackPriorityGroupCount}\n` +
+                `  FEEDBACK UPGRADED MERGE GROUPS: ${analysis.feedbackUpgradedMergeGroups}\n` +
+                `  FEEDBACK UPGRADED DELETE GROUPS: ${analysis.feedbackUpgradedDeleteGroups}\n`,
+              );
+              const topGroups = analysis.groups.slice(0, 3);
+              if (topGroups.length > 0) {
+                process.stderr.write("  TOP GROUPS:\n");
+                for (const group of topGroups) {
+                  const feedbackActions = [];
+                  if (group.actionSources.merge === "feedback") feedbackActions.push("merge");
+                  if (group.actionSources.delete === "feedback") feedbackActions.push("delete");
+                  const feedbackSuffix = feedbackActions.length
+                    ? `, feedback=${feedbackActions.join("+")}`
+                    : "";
+                  process.stderr.write(
+                    `    - ${group.groupKey} (${group.count}, actions=${group.candidateActions.join(",") || "none"}${feedbackSuffix})\n`,
+                  );
+                }
+              }
               process.stderr.write("Dry run — no changes made.\n");
               return;
             }
@@ -1438,6 +1515,10 @@ export function registerCliCommands(
               "<dream-protocol>",
               dreamPrompt,
               "</dream-protocol>",
+              "",
+              formatDreamSummary(analysis),
+              "",
+              formatDreamGroups(analysis),
               "",
               `<all-memories count="${count}" user="${uid}">`,
               memoryDump,

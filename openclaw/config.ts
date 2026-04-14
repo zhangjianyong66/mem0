@@ -150,6 +150,7 @@ const ALLOWED_KEYS = [
   "baseUrl",
   "userId",
   "userEmail",
+  "anonymousTelemetryId",
   "autoCapture",
   "autoRecall",
   "customInstructions",

@@ -63,6 +63,7 @@ function createMockToolDeps(overrides = {}): ToolDeps {
     effectiveUserId: vi.fn().mockReturnValue("testuser"),
     agentUserId: vi.fn().mockReturnValue("testuser:agent:test"),
     getCurrentSessionId: vi.fn().mockReturnValue(undefined),
+    getStateDir: vi.fn().mockReturnValue("/tmp/test-state"),
     skillsActive: false,
     captureToolEvent: vi.fn(),
     buildAddOptions: vi
@@ -409,6 +410,216 @@ describe("memory_add execute", () => {
     expect(addOpts.infer).toBe(false);
     expect(result.details.mode).toBe("skills");
     expect(result.details.category).toBe("preference");
+    expect(result.details.action).toBe("added");
+  });
+
+  it("auto-generates stable metadata keys in skills mode", async () => {
+    const addMock = vi.fn().mockResolvedValue({
+      results: [{ event: "ADD", memory: "stored in skills mode" }],
+    });
+    const ctx = createMockToolDeps({
+      skillsActive: true,
+      provider: {
+        search: vi.fn().mockResolvedValue([]),
+        add: addMock,
+        getAll: vi.fn(),
+        update: vi.fn(),
+        delete: vi.fn(),
+        get: vi.fn(),
+        history: vi.fn(),
+      },
+    });
+    const tool = createMemoryAddTool(ctx);
+
+    await tool.execute("call-5b", {
+      text: "As of 2026-04-01, user is migrating from Postgres to CockroachDB",
+      category: "decision",
+    });
+
+    const addOpts = addMock.mock.calls[0][1];
+    expect(addOpts.metadata.sourceKind).toBe("decision");
+    expect(addOpts.metadata.temporalScope).toBe("ongoing");
+    expect(addOpts.metadata.topicKey).toMatch(/^decision:/);
+    expect(addOpts.metadata.entityKey).toMatch(/^project:/);
+  });
+
+  it("preserves explicit metadata keys in skills mode", async () => {
+    const addMock = vi.fn().mockResolvedValue({
+      results: [{ event: "ADD", memory: "stored in skills mode" }],
+    });
+    const ctx = createMockToolDeps({
+      skillsActive: true,
+      provider: {
+        search: vi.fn().mockResolvedValue([]),
+        add: addMock,
+        getAll: vi.fn(),
+        update: vi.fn(),
+        delete: vi.fn(),
+        get: vi.fn(),
+        history: vi.fn(),
+      },
+    });
+    const tool = createMemoryAddTool(ctx);
+
+    await tool.execute("call-5c", {
+      text: "User rule: verify current config before recommending changes.",
+      category: "rule",
+      metadata: {
+        topicKey: "rule:manual-key",
+        entityKey: "rule:manual-entity",
+        sourceKind: "manual-source",
+        temporalScope: "stable",
+      },
+    });
+
+    const addOpts = addMock.mock.calls[0][1];
+    expect(addOpts.metadata.topicKey).toBe("rule:manual-key");
+    expect(addOpts.metadata.entityKey).toBe("rule:manual-entity");
+    expect(addOpts.metadata.sourceKind).toBe("manual-source");
+    expect(addOpts.metadata.temporalScope).toBe("stable");
+  });
+
+  it("updates a same-topic memory in skills mode when a single high-confidence match exists", async () => {
+    const updateMock = vi.fn().mockResolvedValue(undefined);
+    const ctx = createMockToolDeps({
+      skillsActive: true,
+      provider: {
+        search: vi.fn().mockResolvedValue([
+          {
+            id: "m-topic-1",
+            memory: "As of 2026-04-01, user is migrating from Postgres to CockroachDB.",
+            score: 0.93,
+            metadata: {
+              category: "decision",
+              topicKey: "decision:cockroachdb",
+              entityKey: "project:cockroachdb",
+            },
+          },
+        ]),
+        add: vi.fn(),
+        getAll: vi.fn(),
+        update: updateMock,
+        delete: vi.fn(),
+        get: vi.fn(),
+        history: vi.fn(),
+      },
+    });
+    const tool = createMemoryAddTool(ctx);
+
+    const result = await tool.execute("call-5d", {
+      text: "As of 2026-04-13, user is migrating from Postgres to CockroachDB and plans to cut over this week.",
+      category: "decision",
+      metadata: {
+        topicKey: "decision:cockroachdb",
+        entityKey: "project:cockroachdb",
+      },
+    });
+
+    expect(updateMock).toHaveBeenCalledWith(
+      "m-topic-1",
+      expect.stringContaining("cut over this week"),
+    );
+    expect(ctx.provider!.add).not.toHaveBeenCalled();
+    expect(result.details.action).toBe("updated");
+    expect(result.details.reason).toBe("same_topic_update");
+    expect(result.details.targetMemoryId).toBe("m-topic-1");
+  });
+
+  it("skips semantic duplicates in skills mode", async () => {
+    const addMock = vi.fn();
+    const updateMock = vi.fn();
+    const ctx = createMockToolDeps({
+      skillsActive: true,
+      provider: {
+        search: vi.fn().mockResolvedValue([
+          {
+            id: "m-pref-1",
+            memory: "User prefers direct code-first answers.",
+            score: 0.95,
+            metadata: {
+              category: "preference",
+              topicKey: "preference:direct-code-first",
+            },
+          },
+        ]),
+        add: addMock,
+        getAll: vi.fn(),
+        update: updateMock,
+        delete: vi.fn(),
+        get: vi.fn(),
+        history: vi.fn(),
+      },
+    });
+    const tool = createMemoryAddTool(ctx);
+
+    const result = await tool.execute("call-5e", {
+      text: "User prefers direct code-first answers.",
+      category: "preference",
+      metadata: {
+        topicKey: "preference:direct-code-first",
+      },
+    });
+
+    expect(addMock).not.toHaveBeenCalled();
+    expect(updateMock).not.toHaveBeenCalled();
+    expect(result.details.action).toBe("skipped");
+    expect(result.details.reason).toBe("semantic_duplicate");
+    expect(result.details.targetMemoryId).toBe("m-pref-1");
+  });
+
+  it("falls back to add when multiple strong candidates make the match ambiguous", async () => {
+    const addMock = vi.fn().mockResolvedValue({
+      results: [{ event: "ADD", memory: "stored despite ambiguity" }],
+    });
+    const updateMock = vi.fn();
+    const ctx = createMockToolDeps({
+      skillsActive: true,
+      provider: {
+        search: vi.fn().mockResolvedValue([
+          {
+            id: "m-proj-1",
+            memory: "As of 2026-04-10, user is migrating the gateway to the new host.",
+            score: 0.94,
+            metadata: {
+              category: "project",
+              topicKey: "project:gateway-migration",
+              entityKey: "project:gateway",
+            },
+          },
+          {
+            id: "m-proj-2",
+            memory: "As of 2026-04-11, user is migrating the gateway to the new host and testing nginx config.",
+            score: 0.91,
+            metadata: {
+              category: "project",
+              topicKey: "project:gateway-migration",
+              entityKey: "project:gateway",
+            },
+          },
+        ]),
+        add: addMock,
+        getAll: vi.fn(),
+        update: updateMock,
+        delete: vi.fn(),
+        get: vi.fn(),
+        history: vi.fn(),
+      },
+    });
+    const tool = createMemoryAddTool(ctx);
+
+    const result = await tool.execute("call-5f", {
+      text: "As of 2026-04-13, user is migrating the gateway to the new host and plans final cutover tonight.",
+      category: "project",
+      metadata: {
+        topicKey: "project:gateway-migration",
+        entityKey: "project:gateway",
+      },
+    });
+
+    expect(addMock).toHaveBeenCalledOnce();
+    expect(updateMock).not.toHaveBeenCalled();
+    expect(result.details.action).toBe("added");
+    expect(result.details.reason).toBe("ambiguous_candidates");
   });
 
   it("blocks subagent sessions from storing", async () => {
@@ -885,4 +1096,3 @@ describe("memory_update execute", () => {
     expect(result.details.error).toContain("update conflict");
   });
 });
-

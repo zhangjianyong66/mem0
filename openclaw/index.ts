@@ -24,6 +24,7 @@ import type {
   Mem0Provider,
   AddOptions,
   SearchOptions,
+  MemoryItem,
 } from "./types.ts";
 import { createProvider, providerToBackend } from "./providers.ts";
 import { mem0ConfigSchema } from "./config.ts";
@@ -41,7 +42,16 @@ import {
   loadDreamPrompt,
   isSkillsMode,
 } from "./skill-loader.ts";
-import { recall as skillRecall, sanitizeQuery } from "./recall.ts";
+import {
+  recall as skillRecall,
+  sanitizeQuery,
+  shouldRecallLongTermMemory,
+} from "./recall.ts";
+import {
+  analyzeMemoryInventory,
+  formatDreamGroups,
+  formatDreamSummary,
+} from "./dream-analyzer.ts";
 import {
   incrementSessionCount,
   checkCheapGates,
@@ -58,6 +68,11 @@ import { registerAllTools } from "./tools/index.ts";
 import type { ToolDeps } from "./tools/index.ts";
 import { captureEvent } from "./telemetry.ts";
 import { bootstrapTelemetryFlag } from "./fs-safe.ts";
+import {
+  buildDreamFeedbackRun,
+  recordDreamFeedback,
+  readDreamFeedbackState,
+} from "./dream-feedback.ts";
 
 bootstrapTelemetryFlag();
 
@@ -140,6 +155,7 @@ const memoryPlugin = definePluginEntry({
         (id: string) => `${cfg.userId}:agent:${id}`,
         () => ({ user_id: cfg.userId, top_k: cfg.topK }),
         () => undefined,
+        () => pluginStateDir,
         (cmd: string) => _captureEvent(`openclaw.cli.${cmd}`, { command: cmd }),
       );
 
@@ -245,6 +261,7 @@ const memoryPlugin = definePluginEntry({
       buildAddOptions,
       buildSearchOptions,
       getCurrentSessionId: () => currentSessionId,
+      getStateDir: () => pluginStateDir,
       skillsActive,
       captureToolEvent: (toolName: string, props: Record<string, unknown>) => {
         _captureEvent(`openclaw.tool.${toolName}`, {
@@ -268,6 +285,7 @@ const memoryPlugin = definePluginEntry({
       _agentUserId,
       buildSearchOptions,
       () => currentSessionId,
+      () => pluginStateDir,
       (cmd: string) => _captureEvent(`openclaw.cli.${cmd}`, { command: cmd }),
     );
 
@@ -407,34 +425,54 @@ function registerHooks(
         const recallStart = Date.now();
         try {
           const query = sanitizeQuery(event.prompt);
+          const recallGate = shouldRecallLongTermMemory(query, cfg.skills ?? {});
 
-          // Smart mode: skip session search (saves 1 API call per turn)
-          const sessionIdForRecall =
-            recallStrategy === "always"
-              ? isSubagent
-                ? undefined
-                : sessionId
-              : undefined; // smart: long-term only
+          if (recallGate.decision === "skip") {
+            api.logger.info(
+              `openclaw-mem0: skills-mode recall skipped (${recallGate.reason})`,
+            );
+            _captureEvent("openclaw.hook.recall", {
+              strategy: recallStrategy,
+              decision: "skip",
+              skip_reason: recallGate.reason,
+              query_length: query.length,
+              latency_ms: Date.now() - recallStart,
+            });
+          } else {
+            // Smart mode: skip session search (saves 1 API call per turn)
+            const sessionIdForRecall =
+              recallGate.decision === "long_term_plus_session" ||
+              recallStrategy === "always"
+                ? isSubagent
+                  ? undefined
+                  : sessionId
+                : undefined; // smart: long-term only
 
-          const recallResult = await skillRecall(
-            provider,
-            query,
-            userId,
-            cfg.skills ?? {},
-            sessionIdForRecall,
-          );
+            const recallResult = await skillRecall(
+              provider,
+              query,
+              userId,
+              cfg.skills ?? {},
+              sessionIdForRecall,
+            );
 
-          api.logger.info(
-            `openclaw-mem0: skills-mode recall (strategy=${recallStrategy}) injecting ${recallResult.memories.length} memories (~${recallResult.tokenEstimate} tokens)`,
-          );
+            api.logger.info(
+              `openclaw-mem0: skills-mode recall (strategy=${recallStrategy}, decision=${recallGate.decision}) injecting ${recallResult.memories.length} memories (~${recallResult.tokenEstimate} tokens, raw=${recallResult.debug.rawCandidateCount}, thresholded=${recallResult.debug.postThresholdCount}, deduped=${recallResult.debug.postDedupeCount})`,
+            );
 
-          _captureEvent("openclaw.hook.recall", {
-            strategy: recallStrategy,
-            memory_count: recallResult.memories.length,
-            latency_ms: Date.now() - recallStart,
-          });
+            _captureEvent("openclaw.hook.recall", {
+              strategy: recallStrategy,
+              decision: recallGate.decision,
+              memory_count: recallResult.memories.length,
+              query_length: query.length,
+              raw_candidate_count: recallResult.debug.rawCandidateCount,
+              post_threshold_count: recallResult.debug.postThresholdCount,
+              post_dedupe_count: recallResult.debug.postDedupeCount,
+              latency_ms: Date.now() - recallStart,
+            });
 
-          recallContext = recallResult.context;
+            recallContext = recallResult.context;
+          }
         } catch (err) {
           api.logger.warn(
             `openclaw-mem0: skills-mode recall failed: ${String(err)}`,
@@ -473,8 +511,20 @@ function registerHooks(
             if (memResult.pass && acquireDreamLock(stateDir)) {
               const dreamPrompt = loadDreamPrompt(cfg.skills ?? {});
               if (dreamPrompt) {
+                const feedbackState = readDreamFeedbackState(stateDir);
+                const analysis = analyzeMemoryInventory(
+                  memories as MemoryItem[],
+                  new Date(),
+                  feedbackState,
+                );
+                const dreamSummary = formatDreamSummary(analysis);
+                const dreamGroups = formatDreamGroups(analysis);
                 dreamContext =
                   "\n\n<auto-dream>\nIMPORTANT: Before responding to the user, run a memory consolidation pass. Follow the protocol below, then respond normally.\n\n" +
+                  dreamSummary +
+                  "\n\n" +
+                  dreamGroups +
+                  "\n\n" +
                   dreamPrompt +
                   "\n</auto-dream>";
                 // Track which session triggered dream (session-keyed, not global)
@@ -553,14 +603,22 @@ function registerHooks(
             : false;
 
         if (writeToolUsed) {
+          const feedbackRun = buildDreamFeedbackRun(lastAssistant, Date.now());
+          const feedbackState = recordDreamFeedback(stateDir, feedbackRun);
           releaseDreamLock(stateDir);
           recordDreamCompletion(stateDir);
           _captureEvent("openclaw.hook.dream", {
             phase: "completed",
             write_tools_used: true,
+            parsed_write_actions: feedbackRun.parsedWriteActions,
+            feedback_topics_count: feedbackRun.feedbackTopicsCount,
+            feedback_parse_complete: feedbackRun.parseComplete,
           });
           api.logger.info(
             "openclaw-mem0: auto-dream completed (verified write tool usage), lock released",
+          );
+          api.logger.info(
+            `openclaw-mem0: dream feedback updated (${feedbackRun.parsedWriteActions} actions, ${feedbackState.recentDreamRuns.length} retained runs)`,
           );
         } else {
           releaseDreamLock(stateDir);

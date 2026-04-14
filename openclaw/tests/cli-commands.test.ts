@@ -32,6 +32,26 @@ vi.mock("../skill-loader.ts", () => ({
   loadDreamPrompt: vi.fn().mockReturnValue("dream prompt"),
 }));
 
+vi.mock("../dream-feedback.ts", () => ({
+  readDreamFeedbackState: vi.fn().mockReturnValue({
+    lastUpdatedAt: 1710000000000,
+    recentDreamRuns: [],
+    topicOutcomes: {
+      "identity:testuser": {
+        topicKey: "identity:testuser",
+        mergeFixups: 1,
+        rewriteFixups: 0,
+        duplicateDeletes: 1,
+        consolidatedReplacements: 0,
+        lastUpdatedAt: 1710000000000,
+        lastDreamRunId: "dream-1",
+      },
+    },
+    writeOutcomeByMemoryId: {},
+    dedupeTuning: {},
+  }),
+}));
+
 // ---------------------------------------------------------------------------
 // Imports (after mocks)
 // ---------------------------------------------------------------------------
@@ -44,6 +64,7 @@ import {
   getBaseUrl,
 } from "../cli/config-file.ts";
 import { loadDreamPrompt } from "../skill-loader.ts";
+import { readDreamFeedbackState } from "../dream-feedback.ts";
 
 // ---------------------------------------------------------------------------
 // Mock Commander program builder
@@ -218,6 +239,7 @@ function setup() {
     agentUserId,
     buildSearchOptions,
     getCurrentSessionId,
+    () => "/tmp/test-state",
   );
 
   // Build a mock program and invoke the captured callback
@@ -1155,6 +1177,8 @@ describe("registerCliCommands", () => {
       const stdoutOutput = stdoutSpy.mock.calls.map((c) => c[0]).join("");
       expect(stdoutOutput).toContain("<dream-protocol>");
       expect(stdoutOutput).toContain("dream prompt");
+      expect(stdoutOutput).toContain("<dream-summary");
+      expect(stdoutOutput).toContain("<memory-groups");
       expect(stdoutOutput).toContain("<all-memories");
       expect(stdoutOutput).toContain("User is an engineer");
 
@@ -1172,9 +1196,13 @@ describe("registerCliCommands", () => {
       await dreamCmd._action!({ dryRun: true });
 
       // Dry run should write inventory to stderr, NOT dream prompt to stdout
-      expect(stderrSpy).toHaveBeenCalledWith(
-        expect.stringContaining("Dry run"),
-      );
+      const stderrOutput = stderrSpy.mock.calls.map((c) => c[0]).join("");
+      expect(stderrOutput).toContain("Dry run");
+      expect(stderrOutput).toContain("GROUPS:");
+      expect(stderrOutput).toContain("MERGE CANDIDATE GROUPS:");
+      expect(stderrOutput).toContain("FEEDBACK PRIORITY GROUPS:");
+      expect(stderrOutput).toContain("FEEDBACK UPGRADED MERGE GROUPS:");
+      expect(stderrOutput).toContain("FEEDBACK UPGRADED DELETE GROUPS:");
       expect(stdoutSpy).not.toHaveBeenCalled();
 
       stdoutSpy.mockRestore();
@@ -1216,6 +1244,57 @@ describe("registerCliCommands", () => {
 
       expect(consoleSpy.error).toHaveBeenCalledWith(
         expect.stringContaining("Dream failed"),
+      );
+    });
+  });
+
+  describe("feedback subcommand", () => {
+    it("prints local dream feedback summary", async () => {
+      const { mem0 } = setup();
+      (readDreamFeedbackState as ReturnType<typeof vi.fn>).mockReturnValueOnce({
+        lastUpdatedAt: 1711000000000,
+        recentDreamRuns: [{ id: "dream-1" }],
+        topicOutcomes: {
+          "project:gateway": {
+            topicKey: "project:gateway",
+            mergeFixups: 2,
+            rewriteFixups: 0,
+            duplicateDeletes: 1,
+            consolidatedReplacements: 1,
+            lastUpdatedAt: 1711000000000,
+            lastDreamRunId: "dream-1",
+          },
+        },
+        writeOutcomeByMemoryId: {
+          m1: {
+            memoryId: "m1",
+            mergeFixups: 1,
+            rewriteFixups: 0,
+            duplicateDeletes: 0,
+            consolidatedReplacements: 0,
+            lastUpdatedAt: 1711000000000,
+            lastDreamRunId: "dream-1",
+          },
+        },
+        dedupeTuning: {
+          "project:gateway": {
+            duplicateDeleteBias: 0.08,
+            mergeFixupBias: 0.1,
+            rewriteFixupBias: 0,
+            consolidatedReplacementBias: 0.06,
+            lastUpdatedAt: 1711000000000,
+          },
+        },
+      });
+      const feedbackCmd = findCommand(mem0, "feedback")!;
+
+      feedbackCmd._action!();
+
+      expect(consoleSpy.log).toHaveBeenCalledWith(
+        expect.stringContaining("Tracked Topics: 1"),
+      );
+      expect(consoleSpy.log).toHaveBeenCalledWith(
+        expect.stringContaining("project:gateway"),
       );
     });
   });
@@ -1412,6 +1491,7 @@ describe("registerCliCommands", () => {
         vi.fn((id: string) => `testuser:agent:${id}`),
         vi.fn().mockReturnValue({ user_id: "testuser", top_k: 5 }),
         vi.fn().mockReturnValue(undefined),
+        vi.fn().mockReturnValue("/tmp/test-state"),
       );
 
       // Wait for async action
@@ -1446,6 +1526,7 @@ describe("registerCliCommands", () => {
         vi.fn((id: string) => `testuser:agent:${id}`),
         vi.fn().mockReturnValue({ user_id: "testuser", top_k: 5 }),
         vi.fn().mockReturnValue(undefined),
+        vi.fn().mockReturnValue("/tmp/test-state"),
       );
 
       // Wait for async action

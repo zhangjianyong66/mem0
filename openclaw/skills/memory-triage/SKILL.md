@@ -194,10 +194,12 @@ Categories: `identity`, `configuration`, `rule`, `preference`, `decision`, `tech
 
 ### Updating Existing Memories
 
-When a recalled memory needs updating (fact changed, status changed, new detail added):
-1. `memory_search` to find the existing memory
-2. `memory_delete` on the old memory's ID
-3. `memory_add` with the corrected/expanded fact
+Default path: call `memory_add` with the corrected or expanded fact. The plugin will automatically check for same-topic existing memories and, when safe, convert that write into an in-place update or skip an obvious duplicate.
+
+Use explicit `memory_search`, `memory_update`, or `memory_delete` only when:
+- you already know the exact memory to operate on
+- there are multiple conflicting old memories that need manual cleanup
+- you need to inspect ambiguity before changing anything
 
 **Choose the MORE COMPLETE version.** When both old and new have unique context, COMBINE them into a unified memory using the user's stated words.
 
@@ -209,7 +211,7 @@ When a recalled memory needs updating (fact changed, status changed, new detail 
 **Consolidation**: When a rich new fact encompasses multiple existing memories, update one to the comprehensive version and forget the others.
   - Old: "User has a dog" + "Dog's name is Poppy" + "User walks dog daily"
   - New: "User has a dog named Poppy and says taking him for walks is the best part of their day"
-  - Action: forget all three old memories, store one consolidated memory
+  - Action: `memory_add` the richer fact. If one clear same-topic memory exists, the plugin may auto-update it. If there are multiple conflicting old memories, resolve them manually with search/update/delete.
 
 **Temporary vs permanent changes**: A temporary constraint (e.g., injury pausing a hobby) does NOT contradict the underlying preference. Store the constraint as a new memory; don't delete the preference.
   - Old: "User enjoys hiking on weekends"
