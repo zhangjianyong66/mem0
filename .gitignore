@@ -175,6 +175,9 @@ test-db
 
 notebooks/*.yaml
 .ipynb_checkpoints/
+.claude/
+.metadata_never_index
+*.bak
 
 !configs/*.yaml
 
