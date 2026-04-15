@@ -83,8 +83,10 @@ describe("incrementSessionCount", () => {
       lastSessionId: "session-old",
     });
 
-    incrementSessionCount(STATE_DIR, "session-new");
+    const result = incrementSessionCount(STATE_DIR, "session-new");
 
+    expect(result.incremented).toBe(true);
+    expect(result.state.sessionsSince).toBe(4);
     const written = getWrittenState();
     expect(written.sessionsSince).toBe(4);
     expect(written.lastSessionId).toBe("session-new");
@@ -97,8 +99,10 @@ describe("incrementSessionCount", () => {
       lastSessionId: "session-same",
     });
 
-    incrementSessionCount(STATE_DIR, "session-same");
+    const result = incrementSessionCount(STATE_DIR, "session-same");
 
+    expect(result.incremented).toBe(false);
+    expect(result.state.sessionsSince).toBe(3);
     // writeText should NOT have been called for the state file
     const stateWrites = mockWriteText.mock.calls.filter((c: unknown[]) =>
       (c[0] as string).endsWith("dream-state.json"),

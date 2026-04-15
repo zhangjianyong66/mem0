@@ -43,9 +43,15 @@ describe("shouldRecallLongTermMemory", () => {
     });
   });
 
-  it("recalls long-term memories when history intent is explicit", () => {
+  it("recalls long-term + session memories when history intent is explicit", () => {
     expect(shouldRecallLongTermMemory("我之前怎么配的飞书 replyMode", {})).toEqual({
-      decision: "long_term",
+      decision: "long_term_plus_session",
+    });
+  });
+
+  it("recalls long-term + session memories for a meaningful continuation", () => {
+    expect(shouldRecallLongTermMemory("继续分析这个配置", {})).toEqual({
+      decision: "long_term_plus_session",
     });
   });
 });

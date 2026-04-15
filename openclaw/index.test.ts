@@ -8,6 +8,7 @@ import {
   effectiveUserId,
   agentUserId,
   resolveUserId,
+  resolveDreamStateDir,
   isNonInteractiveTrigger,
   isSubagentSession,
   isNoiseMessage,
@@ -152,6 +153,38 @@ describe("resolveUserId", () => {
 
   it("ignores empty-string userId (falsy)", () => {
     expect(resolveUserId(base, { userId: "" })).toBe("alice");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveDreamStateDir
+// ---------------------------------------------------------------------------
+describe("resolveDreamStateDir", () => {
+  it("prefers the session stateDir when available", () => {
+    expect(resolveDreamStateDir("/tmp/session", "/tmp/plugin")).toEqual({
+      stateDir: "/tmp/session",
+      source: "session",
+    });
+  });
+
+  it("falls back to the plugin stateDir when the session one is missing", () => {
+    expect(resolveDreamStateDir(undefined, "/tmp/plugin")).toEqual({
+      stateDir: "/tmp/plugin",
+      source: "plugin",
+    });
+  });
+
+  it("falls back to the runtime stateDir when session and plugin are missing", () => {
+    expect(resolveDreamStateDir(undefined, undefined, "/tmp/runtime")).toEqual({
+      stateDir: "/tmp/runtime",
+      source: "runtime",
+    });
+  });
+
+  it("returns none when neither stateDir is available", () => {
+    expect(resolveDreamStateDir(undefined, undefined, undefined)).toEqual({
+      source: "none",
+    });
   });
 });
 

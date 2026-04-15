@@ -145,6 +145,15 @@ function includesAny(text: string, patterns: string[]): boolean {
   return patterns.some((pattern) => text.includes(pattern.toLowerCase()));
 }
 
+function stripPatterns(text: string, patterns: string[]): string {
+  let cleaned = text;
+  const orderedPatterns = [...patterns].sort((a, b) => b.length - a.length);
+  for (const pattern of orderedPatterns) {
+    cleaned = cleaned.split(pattern.toLowerCase()).join("");
+  }
+  return normalizeText(cleaned);
+}
+
 function isLikelyCurrentTaskRequest(text: string): boolean {
   return (
     includesAny(text, CURRENT_TASK_PATTERNS) ||
@@ -154,6 +163,21 @@ function isLikelyCurrentTaskRequest(text: string): boolean {
 
 function wantsIdentityContext(text: string): boolean {
   return includesAny(text, IDENTITY_QUERY_PATTERNS);
+}
+
+function hasHistoryIntent(text: string, patterns: string[]): boolean {
+  return includesAny(text, patterns);
+}
+
+function hasContinuationIntent(text: string, patterns: string[]): boolean {
+  return includesAny(text, patterns);
+}
+
+function hasMeaningfulContinuation(
+  text: string,
+  patterns: string[],
+): boolean {
+  return stripPatterns(text, patterns).length > 0;
 }
 
 function getMemoryImportance(memory: MemoryItem): number {
@@ -364,17 +388,28 @@ export function shouldRecallLongTermMemory(
   if (!normalized) {
     return { decision: "skip", reason: "empty_query" };
   }
-  if (isLikelyCurrentTaskRequest(normalized)) {
+
+  const historyIntent =
+    hasHistoryIntent(normalized, historyPatterns);
+  const continuationIntent =
+    hasContinuationIntent(normalized, continuationPatterns);
+  const meaningfulContinuation =
+    hasMeaningfulContinuation(normalized, continuationPatterns);
+
+  if (historyIntent) {
+    return { decision: "long_term_plus_session" };
+  }
+  if (continuationIntent && meaningfulContinuation) {
+    return { decision: "long_term_plus_session" };
+  }
+  if (isLikelyCurrentTaskRequest(normalized) && !continuationIntent) {
     return { decision: "skip", reason: "current_task_context" };
   }
   if (cleanQuery.length <= shortQueryChars) {
     return { decision: "skip", reason: "short_query" };
   }
-  if (includesAny(normalized, continuationPatterns)) {
+  if (continuationIntent) {
     return { decision: "skip", reason: "continuation" };
-  }
-  if (includesAny(normalized, historyPatterns)) {
-    return { decision: "long_term" };
   }
 
   return { decision: "long_term" };

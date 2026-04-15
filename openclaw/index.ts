@@ -59,6 +59,7 @@ import {
   acquireDreamLock,
   releaseDreamLock,
   recordDreamCompletion,
+  getDreamState,
 } from "./dream-gate.ts";
 import { PlatformBackend } from "./backend/platform.ts";
 import type { Backend } from "./backend/base.ts";
@@ -101,6 +102,26 @@ export { createProvider } from "./providers.ts";
 // ============================================================================
 // Helpers
 // ============================================================================
+
+export function resolveDreamStateDir(
+  sessionStateDir?: string,
+  pluginStateDir?: string,
+  runtimeStateDir?: string,
+): {
+  stateDir?: string;
+  source: "session" | "plugin" | "runtime" | "none";
+} {
+  if (sessionStateDir) {
+    return { stateDir: sessionStateDir, source: "session" };
+  }
+  if (pluginStateDir) {
+    return { stateDir: pluginStateDir, source: "plugin" };
+  }
+  if (runtimeStateDir) {
+    return { stateDir: runtimeStateDir, source: "runtime" };
+  }
+  return { source: "none" };
+}
 
 // ============================================================================
 // Plugin Definition
@@ -185,6 +206,10 @@ const memoryPlugin = definePluginEntry({
     // Shared mutable state — declared together before any closures capture them.
     let currentSessionId: string | undefined;
     let pluginStateDir: string | undefined;
+    const resolveRuntimeStateDir = () =>
+      (api.runtime as { state?: { resolveStateDir?: () => string } })?.state?.resolveStateDir?.() ??
+      "";
+    const resolveEffectiveStateDir = () => pluginStateDir ?? resolveRuntimeStateDir();
 
     // ========================================================================
     // Per-agent isolation helpers (thin wrappers around exported functions)
@@ -261,7 +286,7 @@ const memoryPlugin = definePluginEntry({
       buildAddOptions,
       buildSearchOptions,
       getCurrentSessionId: () => currentSessionId,
-      getStateDir: () => pluginStateDir,
+      getStateDir: resolveEffectiveStateDir,
       skillsActive,
       captureToolEvent: (toolName: string, props: Record<string, unknown>) => {
         _captureEvent(`openclaw.tool.${toolName}`, {
@@ -285,7 +310,7 @@ const memoryPlugin = definePluginEntry({
       _agentUserId,
       buildSearchOptions,
       () => currentSessionId,
-      () => pluginStateDir,
+      resolveEffectiveStateDir,
       (cmd: string) => _captureEvent(`openclaw.cli.${cmd}`, { command: cmd }),
     );
 
@@ -304,7 +329,8 @@ const memoryPlugin = definePluginEntry({
         setCurrentSessionId: (id: string) => {
           currentSessionId = id;
         },
-        getStateDir: () => pluginStateDir,
+        getPluginStateDir: () => pluginStateDir,
+        getRuntimeStateDir: resolveRuntimeStateDir,
       },
       skillsActive,
       _captureEvent,
@@ -317,7 +343,7 @@ const memoryPlugin = definePluginEntry({
     api.registerService({
       id: "openclaw-mem0",
       start: (...args: any[]) => {
-        pluginStateDir = args[0]?.stateDir;
+        pluginStateDir = args[0]?.stateDir ?? resolveRuntimeStateDir();
         api.logger.info(
           `openclaw-mem0: initialized (mode: ${cfg.mode}, user: ${cfg.userId}, autoRecall: ${cfg.autoRecall}, autoCapture: ${cfg.autoCapture}, stateDir: ${pluginStateDir ?? "none"})`,
         );
@@ -332,6 +358,31 @@ const memoryPlugin = definePluginEntry({
 // ============================================================================
 // Lifecycle Hook Registration
 // ============================================================================
+
+function logDreamDiagnostics(
+  api: OpenClawPluginApi,
+  capture: (event: string, props?: Record<string, unknown>) => void,
+  phase: string,
+  stateDir: string | undefined,
+  props: Record<string, unknown> = {},
+): void {
+  const state = stateDir ? getDreamState(stateDir) : undefined;
+  const payload = {
+    phase,
+    ...props,
+    state_dir_present: Boolean(stateDir),
+    dream_last_consolidated_at: state?.lastConsolidatedAt ?? null,
+    dream_sessions_since: state?.sessionsSince ?? null,
+    dream_last_session_id: state?.lastSessionId ?? null,
+  };
+  capture("openclaw.hook.dream", payload);
+
+  const details = Object.entries(payload)
+    .filter(([, value]) => value !== undefined && value !== null)
+    .map(([key, value]) => `${key}=${String(value)}`)
+    .join(", ");
+  api.logger.info(`openclaw-mem0: auto-dream ${phase}${details ? ` (${details})` : ""}`);
+}
 
 function registerHooks(
   api: OpenClawPluginApi,
@@ -351,7 +402,8 @@ function registerHooks(
   ) => SearchOptions,
   session: {
     setCurrentSessionId: (id: string) => void;
-    getStateDir: () => string | undefined;
+    getPluginStateDir: () => string | undefined;
+    getRuntimeStateDir: () => string;
   },
   skillsActive: boolean = false,
   _captureEvent: (
@@ -403,6 +455,7 @@ function registerHooks(
 
       const isSubagent = isSubagentSession(sessionId);
       const userId = _effectiveUserId(isSubagent ? undefined : sessionId);
+      const runtimeStateDir = session.getRuntimeStateDir();
 
       // Static protocol goes in prependSystemContext (cacheable across turns)
       let systemContext = loadTriagePrompt(cfg.skills ?? {});
@@ -484,20 +537,71 @@ function registerHooks(
         );
       }
 
+      const sessionStateDir = session.getPluginStateDir();
+      const dreamStateResolution = resolveDreamStateDir(
+        sessionStateDir,
+        runtimeStateDir,
+      );
+      const resolvedDreamStateDir = dreamStateResolution.stateDir;
+
       // Auto-dream: check CHEAP gates first (local file reads only).
       // Only hit the API for memory count if time + session gates pass.
-      const stateDir = session.getStateDir();
       const dreamEnabled =
         cfg.skills?.dream?.enabled !== false &&
         cfg.skills?.dream?.auto !== false;
       let dreamContext = "";
-      if (dreamEnabled && stateDir && !isSubagent) {
+      if (!dreamEnabled) {
+        return {
+          prependSystemContext: systemContext, // cached by provider
+          prependContext: recallContext, // per-turn dynamic
+        };
+      }
+
+      if (!resolvedDreamStateDir) {
+        logDreamDiagnostics(
+          api,
+          _captureEvent,
+          "skipped",
+          resolvedDreamStateDir,
+          {
+            reason: "missing_state_dir",
+            session_state_dir_present: Boolean(sessionStateDir),
+            plugin_state_dir_present: Boolean(sessionStateDir),
+            runtime_state_dir_present: Boolean(runtimeStateDir),
+            state_dir_source: dreamStateResolution.source,
+          },
+        );
+      } else if (isSubagent) {
+        logDreamDiagnostics(
+          api,
+          _captureEvent,
+          "skipped",
+          resolvedDreamStateDir,
+          {
+            reason: "subagent_session",
+            runtime_state_dir_present: Boolean(runtimeStateDir),
+            state_dir_source: dreamStateResolution.source,
+          },
+        );
+      } else {
         try {
           const cheapResult = checkCheapGates(
-            stateDir,
+            resolvedDreamStateDir,
             cfg.skills?.dream ?? {},
           );
-          if (cheapResult.proceed) {
+          if (!cheapResult.proceed) {
+            logDreamDiagnostics(
+              api,
+              _captureEvent,
+              "gate_skipped",
+              resolvedDreamStateDir,
+              {
+                reason: cheapResult.reason ?? "cheap_gate_failed",
+                state_dir_source: dreamStateResolution.source,
+                runtime_state_dir_present: Boolean(runtimeStateDir),
+              },
+            );
+          } else {
             // Cheap gates passed. Now do the expensive memory count check.
             const memories = await provider.getAll({
               user_id: userId,
@@ -508,10 +612,35 @@ function registerHooks(
               memCount,
               cfg.skills?.dream ?? {},
             );
-            if (memResult.pass && acquireDreamLock(stateDir)) {
+            if (!memResult.pass) {
+              logDreamDiagnostics(
+                api,
+                _captureEvent,
+                "gate_skipped",
+                resolvedDreamStateDir,
+                {
+                  reason: memResult.reason ?? "memory_gate_failed",
+                  memory_count: memCount,
+                  runtime_state_dir_present: Boolean(runtimeStateDir),
+                  state_dir_source: dreamStateResolution.source,
+                },
+              );
+            } else if (!acquireDreamLock(resolvedDreamStateDir)) {
+              logDreamDiagnostics(
+                api,
+                _captureEvent,
+                "lock_busy",
+                resolvedDreamStateDir,
+                {
+                  memory_count: memCount,
+                  runtime_state_dir_present: Boolean(runtimeStateDir),
+                  state_dir_source: dreamStateResolution.source,
+                },
+              );
+            } else {
               const dreamPrompt = loadDreamPrompt(cfg.skills ?? {});
               if (dreamPrompt) {
-                const feedbackState = readDreamFeedbackState(stateDir);
+                const feedbackState = readDreamFeedbackState(resolvedDreamStateDir);
                 const analysis = analyzeMemoryInventory(
                   memories as MemoryItem[],
                   new Date(),
@@ -529,22 +658,39 @@ function registerHooks(
                   "\n</auto-dream>";
                 // Track which session triggered dream (session-keyed, not global)
                 dreamSessionId = sessionId;
-                _captureEvent("openclaw.hook.dream", {
-                  phase: "triggered",
+                dreamStateDir = resolvedDreamStateDir;
+                dreamStateSource = dreamStateResolution.source;
+                logDreamDiagnostics(api, _captureEvent, "triggered", resolvedDreamStateDir, {
                   memory_count: memCount,
+                  groups: analysis.groupCount,
+                  stale_candidates: analysis.staleCandidateCount,
+                  delete_candidates: analysis.deleteCandidateCount,
+                  rewrite_candidates: analysis.rewriteCandidateCount,
+                  runtime_state_dir_present: Boolean(runtimeStateDir),
+                  state_dir_source: dreamStateResolution.source,
                 });
-                api.logger.info(
-                  `openclaw-mem0: auto-dream triggered (${memCount} memories, gate passed)`,
-                );
               } else {
-                releaseDreamLock(stateDir);
+                releaseDreamLock(resolvedDreamStateDir);
+                logDreamDiagnostics(
+                  api,
+                  _captureEvent,
+                  "prompt_missing",
+                  resolvedDreamStateDir,
+                  {
+                    memory_count: memCount,
+                    runtime_state_dir_present: Boolean(runtimeStateDir),
+                    state_dir_source: dreamStateResolution.source,
+                  },
+                );
               }
             }
           }
         } catch (err) {
-          api.logger.warn(
-            `openclaw-mem0: auto-dream gate check failed: ${String(err)}`,
-          );
+          logDreamDiagnostics(api, _captureEvent, "gate_error", resolvedDreamStateDir, {
+            error: String(err),
+            runtime_state_dir_present: Boolean(runtimeStateDir),
+            state_dir_source: dreamStateResolution.source,
+          });
         }
       }
 
@@ -557,25 +703,40 @@ function registerHooks(
     // Session-keyed dream tracking. Only the session that triggered dream
     // can complete it. Prevents cross-session false completion.
     let dreamSessionId: string | undefined;
+    let dreamStateDir: string | undefined;
+    let dreamStateSource: "session" | "plugin" | "runtime" | "none" = "none";
 
     api.on("agent_end", async (event: any, ctx: any) => {
       const sessionId = ctx?.sessionKey ?? undefined;
       const trigger = ctx?.trigger ?? undefined;
       if (sessionId) session.setCurrentSessionId(sessionId);
+      const sessionStateDir = session.getPluginStateDir();
+      const runtimeStateDir = session.getRuntimeStateDir();
+      const dreamStateResolution = resolveDreamStateDir(
+        sessionStateDir,
+        runtimeStateDir,
+      );
+      const effectiveDreamStateDir =
+        dreamStateResolution.stateDir ?? dreamStateDir;
+      const effectiveDreamStateSource =
+        dreamStateResolution.stateDir ? dreamStateResolution.source : dreamStateSource;
 
       // If dream was triggered for THIS session, handle cleanup regardless
       // of success/failure. A failed turn must still release the lock.
-      const stateDir = session.getStateDir();
-      if (dreamSessionId && dreamSessionId === sessionId && stateDir) {
+      if (dreamSessionId && dreamSessionId === sessionId && effectiveDreamStateDir) {
         dreamSessionId = undefined;
+        dreamStateDir = undefined;
+        dreamStateSource = "none";
 
         if (!event.success) {
           // Turn failed/aborted after lock acquired. Release lock, do not
           // record completion. Gates will re-trigger next eligible turn.
-          releaseDreamLock(stateDir);
-          api.logger.warn(
-            "openclaw-mem0: auto-dream turn failed, lock released, will retry",
-          );
+          releaseDreamLock(effectiveDreamStateDir);
+          logDreamDiagnostics(api, _captureEvent, "turn_failed", effectiveDreamStateDir, {
+            reason: "assistant_turn_failed",
+            runtime_state_dir_present: Boolean(runtimeStateDir),
+            state_dir_source: effectiveDreamStateSource,
+          });
           return;
         }
 
@@ -604,27 +765,25 @@ function registerHooks(
 
         if (writeToolUsed) {
           const feedbackRun = buildDreamFeedbackRun(lastAssistant, Date.now());
-          const feedbackState = recordDreamFeedback(stateDir, feedbackRun);
-          releaseDreamLock(stateDir);
-          recordDreamCompletion(stateDir);
-          _captureEvent("openclaw.hook.dream", {
-            phase: "completed",
+          const feedbackState = recordDreamFeedback(effectiveDreamStateDir, feedbackRun);
+          releaseDreamLock(effectiveDreamStateDir);
+          recordDreamCompletion(effectiveDreamStateDir);
+          logDreamDiagnostics(api, _captureEvent, "completed", effectiveDreamStateDir, {
             write_tools_used: true,
             parsed_write_actions: feedbackRun.parsedWriteActions,
             feedback_topics_count: feedbackRun.feedbackTopicsCount,
             feedback_parse_complete: feedbackRun.parseComplete,
+            retained_runs: feedbackState.recentDreamRuns.length,
+            runtime_state_dir_present: Boolean(runtimeStateDir),
+            state_dir_source: effectiveDreamStateSource,
           });
-          api.logger.info(
-            "openclaw-mem0: auto-dream completed (verified write tool usage), lock released",
-          );
-          api.logger.info(
-            `openclaw-mem0: dream feedback updated (${feedbackRun.parsedWriteActions} actions, ${feedbackState.recentDreamRuns.length} retained runs)`,
-          );
         } else {
-          releaseDreamLock(stateDir);
-          api.logger.warn(
-            "openclaw-mem0: auto-dream injected but no write tools executed. Lock released, will retry.",
-          );
+          releaseDreamLock(effectiveDreamStateDir);
+          logDreamDiagnostics(api, _captureEvent, "no_write", effectiveDreamStateDir, {
+            reason: "no_write_tools_executed",
+            runtime_state_dir_present: Boolean(runtimeStateDir),
+            state_dir_source: effectiveDreamStateSource,
+          });
         }
         return;
       }
@@ -633,11 +792,25 @@ function registerHooks(
 
       // Track session for dream gating (interactive turns only)
       if (
-        stateDir &&
+        effectiveDreamStateDir &&
         sessionId &&
         !isNonInteractiveTrigger(trigger, sessionId)
       ) {
-        incrementSessionCount(stateDir, sessionId);
+        const sessionUpdate = incrementSessionCount(
+          effectiveDreamStateDir,
+          sessionId,
+        );
+        if (sessionUpdate.incremented) {
+          _captureEvent("openclaw.hook.dream", {
+            phase: "session_counted",
+            session_id: sessionId,
+            sessions_since: sessionUpdate.state.sessionsSince,
+            state_dir_source: dreamStateResolution.source,
+          });
+          api.logger.info(
+            `openclaw-mem0: auto-dream session counted (session=${sessionId}, sessions_since=${sessionUpdate.state.sessionsSince})`,
+          );
+        }
       }
 
       api.logger.info("openclaw-mem0: skills-mode agent_end (no auto-capture)");

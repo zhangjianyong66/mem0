@@ -19,6 +19,11 @@ interface DreamState {
   lastSessionId: string | null;
 }
 
+export interface DreamSessionIncrementResult {
+  incremented: boolean;
+  state: DreamState;
+}
+
 interface DreamLock {
   pid: number;
   startedAt: number;
@@ -83,13 +88,16 @@ function writeState(stateDir: string, state: DreamState): void {
 export function incrementSessionCount(
   stateDir: string,
   sessionId: string,
-): void {
+): DreamSessionIncrementResult {
   const state = readState(stateDir);
-  if (state.lastSessionId !== sessionId) {
-    state.sessionsSince++;
-    state.lastSessionId = sessionId;
-    writeState(stateDir, state);
+  if (state.lastSessionId === sessionId) {
+    return { incremented: false, state };
   }
+
+  state.sessionsSince++;
+  state.lastSessionId = sessionId;
+  writeState(stateDir, state);
+  return { incremented: true, state };
 }
 
 // ============================================================================
