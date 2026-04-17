@@ -113,6 +113,7 @@ export interface DreamGroup {
   oldest: string;
   newest: string;
   candidateActions: string[];
+  members?: MemoryItem[];
   representativeMemories: MemoryItem[];
   feedbackPriority: number;
   feedbackSignals: {
@@ -300,6 +301,7 @@ export function analyzeMemoryInventory(
         sorted[sorted.length - 1]?.created_at ??
         "unknown",
       candidateActions: [...candidateActions],
+      members: sorted,
       representativeMemories: sorted.slice(0, 3),
       feedbackPriority,
       feedbackSignals,

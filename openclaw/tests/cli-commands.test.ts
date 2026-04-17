@@ -52,6 +52,15 @@ vi.mock("../dream-feedback.ts", () => ({
   }),
 }));
 
+vi.mock("../dream-gate.ts", () => ({
+  getDreamState: vi.fn(),
+  getDreamLockInfo: vi.fn(),
+}));
+
+vi.mock("../dream-queue.ts", () => ({
+  listDreamJobs: vi.fn(),
+}));
+
 // ---------------------------------------------------------------------------
 // Imports (after mocks)
 // ---------------------------------------------------------------------------
@@ -65,6 +74,8 @@ import {
 } from "../cli/config-file.ts";
 import { loadDreamPrompt } from "../skill-loader.ts";
 import { readDreamFeedbackState } from "../dream-feedback.ts";
+import { getDreamLockInfo, getDreamState } from "../dream-gate.ts";
+import { listDreamJobs } from "../dream-queue.ts";
 
 // ---------------------------------------------------------------------------
 // Mock Commander program builder
@@ -282,6 +293,45 @@ describe("registerCliCommands", () => {
     (writePluginAuth as ReturnType<typeof vi.fn>).mockImplementation(() => {});
     (getBaseUrl as ReturnType<typeof vi.fn>).mockReturnValue("https://api.mem0.ai");
     (loadDreamPrompt as ReturnType<typeof vi.fn>).mockReturnValue("dream prompt");
+    (getDreamState as ReturnType<typeof vi.fn>).mockReturnValue({
+      lastConsolidatedAt: 1710000000000,
+      sessionsSince: 4,
+      lastSessionId: "session-1",
+    });
+    (getDreamLockInfo as ReturnType<typeof vi.fn>).mockReturnValue({
+      present: true,
+      pid: 1234,
+      startedAt: 1710001000000,
+      ageMs: 120000,
+      stale: false,
+    });
+    (listDreamJobs as ReturnType<typeof vi.fn>).mockReturnValue([
+      {
+        id: "job-1",
+        userId: "testuser",
+        stateDir: "/tmp/test-state",
+        stateSource: "session",
+        reason: "sessions_since=5",
+        priority: 5,
+        status: "pending",
+        attempts: 0,
+        createdAt: 1710002000000,
+        updatedAt: 1710002000000,
+      },
+      {
+        id: "job-2",
+        userId: "testuser",
+        stateDir: "/tmp/test-state",
+        stateSource: "plugin",
+        reason: "sessions_since=6",
+        priority: 6,
+        status: "running",
+        attempts: 1,
+        createdAt: 1710002100000,
+        updatedAt: 1710002200000,
+        claimedAt: 1710002200000,
+      },
+    ]);
 
     consoleSpy = {
       log: vi.spyOn(console, "log").mockImplementation(() => {}),
@@ -327,6 +377,7 @@ describe("registerCliCommands", () => {
       expect(names).toContain("delete");
       expect(names).toContain("status");
       expect(names).toContain("config");
+      expect(names).toContain("dream-status");
       expect(names).toContain("dream");
     });
 
@@ -1141,6 +1192,39 @@ describe("registerCliCommands", () => {
       const logged = consoleSpy.log.mock.calls[0][0] as string;
       expect(logged).toContain("...");
       expect(logged).not.toContain("new-secret-key");
+    });
+  });
+
+  // ========================================================================
+  // dream-status subcommand
+  // ========================================================================
+
+  describe("dream-status subcommand", () => {
+    it("registers and prints queue, lock, and state summary", () => {
+      const { mem0 } = setup();
+      const dreamStatusCmd = findCommand(mem0, "dream-status")!;
+
+      dreamStatusCmd._action!();
+
+      expect(consoleSpy.log).toHaveBeenCalledWith("Dream auto: enabled");
+      expect(consoleSpy.log).toHaveBeenCalledWith("Mode: platform");
+      expect(consoleSpy.log).toHaveBeenCalledWith("State dir: /tmp/test-state");
+      expect(consoleSpy.log).toHaveBeenCalledWith("Last consolidated: 2024-03-09T16:00:00.000Z");
+      expect(consoleSpy.log).toHaveBeenCalledWith("Sessions since consolidation: 4");
+      expect(consoleSpy.log).toHaveBeenCalledWith("Last session id: session-1");
+      expect(consoleSpy.log).toHaveBeenCalledWith(
+        expect.stringContaining("Lock: held (pid=1234)"),
+      );
+      expect(consoleSpy.log).toHaveBeenCalledWith(
+        "Queue: total=2, pending=1, running=1, completed=0, failed=0",
+      );
+      expect(consoleSpy.log).toHaveBeenCalledWith("Recent jobs:");
+      expect(consoleSpy.log).toHaveBeenCalledWith(
+        expect.stringContaining("job-2"),
+      );
+      expect(consoleSpy.log).toHaveBeenCalledWith(
+        expect.stringContaining("job-1"),
+      );
     });
   });
 

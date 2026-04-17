@@ -29,6 +29,14 @@ interface DreamLock {
   startedAt: number;
 }
 
+export interface DreamLockInfo {
+  present: boolean;
+  pid?: number;
+  startedAt?: number;
+  ageMs?: number;
+  stale?: boolean;
+}
+
 interface DreamGateConfig {
   minHours: number;
   minSessions: number;
@@ -200,6 +208,27 @@ export function releaseDreamLock(stateDir: string): void {
     unlink(lockPath(stateDir));
   } catch {
     /* already gone */
+  }
+}
+
+/**
+ * Inspect the current dream lock without mutating it.
+ */
+export function getDreamLockInfo(stateDir: string): DreamLockInfo {
+  try {
+    const raw = readText(lockPath(stateDir));
+    const lock = JSON.parse(raw) as Partial<DreamLock>;
+    const startedAt = typeof lock.startedAt === "number" ? lock.startedAt : undefined;
+    const ageMs = startedAt !== undefined ? Date.now() - startedAt : undefined;
+    return {
+      present: true,
+      pid: typeof lock.pid === "number" ? lock.pid : undefined,
+      startedAt,
+      ageMs,
+      stale: ageMs !== undefined ? ageMs > LOCK_STALE_MS : undefined,
+    };
+  } catch {
+    return { present: false };
   }
 }
 

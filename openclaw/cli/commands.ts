@@ -21,6 +21,7 @@
  *   - event list  : List recent background events
  *   - event status: Get status of a specific event
  *   - dream       : Run memory consolidation
+ *   - dream-status: Show dream worker/queue status
  *
  * Naming conventions match the Python CLI (`mem0 init`, `mem0 search`, etc.)
  */
@@ -43,6 +44,8 @@ import {
   formatDreamSummary,
 } from "../dream-analyzer.ts";
 import { readDreamFeedbackState } from "../dream-feedback.ts";
+import { getDreamLockInfo, getDreamState } from "../dream-gate.ts";
+import { listDreamJobs } from "../dream-queue.ts";
 import { readText } from "../fs-safe.ts";
 import type { PluginAuthConfig } from "./config-file.ts";
 import {
@@ -227,6 +230,51 @@ function saveOssConfig(userIdFlag?: string): void {
   console.log(`  Configuration saved to ${OPENCLAW_CONFIG_FILE}`);
   console.log(`  Mode: open-source`);
   console.log(`  User ID: ${userId}`);
+}
+
+function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "unknown";
+  const totalSeconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
+  if (days > 0) return `${days}d ${hours % 24}h`;
+  if (hours > 0) return `${hours}h ${minutes % 60}m`;
+  if (minutes > 0) return `${minutes}m ${totalSeconds % 60}s`;
+  return `${totalSeconds}s`;
+}
+
+function formatTimestamp(ms?: number): string {
+  if (!ms) return "never";
+  try {
+    return new Date(ms).toISOString();
+  } catch {
+    return "invalid";
+  }
+}
+
+function formatDreamJobLine(job: {
+  id: string;
+  status: string;
+  priority: number;
+  attempts: number;
+  reason: string;
+  updatedAt: number;
+  nextAttemptAt?: number;
+}): string {
+  const parts = [
+    `${job.id}`,
+    `status=${job.status}`,
+    `priority=${job.priority}`,
+    `attempts=${job.attempts}`,
+    `updated=${formatTimestamp(job.updatedAt)}`,
+    `reason=${job.reason}`,
+  ];
+  if (job.nextAttemptAt) {
+    const waitMs = job.nextAttemptAt - Date.now();
+    parts.push(`retry_in=${formatDuration(waitMs)}`);
+  }
+  return `  - ${parts.join(", ")}`;
 }
 
 // ============================================================================
@@ -935,6 +983,84 @@ export function registerCliCommands(
             }
           } catch (err) {
             console.error(`Status check failed: ${String(err)}`);
+          }
+        });
+
+      // ====================================================================
+      // dream-status
+      // ====================================================================
+
+      mem0
+        .command("dream-status")
+        .description("Show background dream worker and queue status")
+        .action(() => {
+          try {
+            const stateDir = getStateDir?.();
+            const dreamEnabled = cfg.skills?.dream?.enabled !== false;
+            const dreamAuto = cfg.skills?.dream?.auto !== false;
+            const statusLabel = dreamEnabled && dreamAuto ? "enabled" : "disabled";
+
+            console.log(`Dream auto: ${statusLabel}`);
+            console.log(`Mode: ${cfg.mode}`);
+            console.log(`State dir: ${stateDir ?? "unavailable"}`);
+
+            if (!stateDir) {
+              console.log("No persistent state directory available.");
+              return;
+            }
+
+            const dreamState = getDreamState(stateDir);
+            const lock = getDreamLockInfo(stateDir);
+            const jobs = listDreamJobs(stateDir);
+            const counts = jobs.reduce(
+              (acc, job) => {
+                acc.total += 1;
+                if (job.status === "pending") acc.pending += 1;
+                else if (job.status === "running") acc.running += 1;
+                else if (job.status === "completed") acc.completed += 1;
+                else if (job.status === "failed") acc.failed += 1;
+                return acc;
+              },
+              {
+                total: 0,
+                pending: 0,
+                running: 0,
+                completed: 0,
+                failed: 0,
+              },
+            );
+
+            console.log(`Last consolidated: ${formatTimestamp(dreamState.lastConsolidatedAt)}`);
+            console.log(`Sessions since consolidation: ${dreamState.sessionsSince}`);
+            console.log(`Last session id: ${dreamState.lastSessionId ?? "none"}`);
+
+            if (lock.present) {
+              const lockAge = lock.ageMs !== undefined ? `, age=${formatDuration(lock.ageMs)}` : "";
+              const staleLabel = lock.stale ? ", stale=true" : "";
+              console.log(
+                `Lock: held${lock.pid !== undefined ? ` (pid=${lock.pid})` : ""}${lock.startedAt ? `, started=${formatTimestamp(lock.startedAt)}` : ""}${lockAge}${staleLabel}`,
+              );
+            } else {
+              console.log("Lock: none");
+            }
+
+            console.log(
+              `Queue: total=${counts.total}, pending=${counts.pending}, running=${counts.running}, completed=${counts.completed}, failed=${counts.failed}`,
+            );
+
+            const recentJobs = [...jobs]
+              .sort((a, b) => b.updatedAt - a.updatedAt)
+              .slice(0, 5);
+            if (recentJobs.length > 0) {
+              console.log("Recent jobs:");
+              for (const job of recentJobs) {
+                console.log(formatDreamJobLine(job));
+              }
+            } else {
+              console.log("Recent jobs: none");
+            }
+          } catch (err) {
+            console.error(`Dream status failed: ${String(err)}`);
           }
         });
 

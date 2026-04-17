@@ -39,7 +39,6 @@ import {
 } from "./isolation.ts";
 import {
   loadTriagePrompt,
-  loadDreamPrompt,
   isSkillsMode,
 } from "./skill-loader.ts";
 import {
@@ -48,19 +47,11 @@ import {
   shouldRecallLongTermMemory,
 } from "./recall.ts";
 import {
-  analyzeMemoryInventory,
-  formatDreamGroups,
-  formatDreamSummary,
-} from "./dream-analyzer.ts";
-import {
   incrementSessionCount,
   checkCheapGates,
-  checkMemoryGate,
-  acquireDreamLock,
-  releaseDreamLock,
-  recordDreamCompletion,
   getDreamState,
 } from "./dream-gate.ts";
+import { enqueueDreamJob } from "./dream-queue.ts";
 import { PlatformBackend } from "./backend/platform.ts";
 import type { Backend } from "./backend/base.ts";
 import { registerCliCommands } from "./cli/commands.ts";
@@ -69,11 +60,7 @@ import { registerAllTools } from "./tools/index.ts";
 import type { ToolDeps } from "./tools/index.ts";
 import { captureEvent } from "./telemetry.ts";
 import { bootstrapTelemetryFlag } from "./fs-safe.ts";
-import {
-  buildDreamFeedbackRun,
-  recordDreamFeedback,
-  readDreamFeedbackState,
-} from "./dream-feedback.ts";
+import { drainDreamQueue } from "./dream-worker.ts";
 
 bootstrapTelemetryFlag();
 
@@ -315,6 +302,49 @@ const memoryPlugin = definePluginEntry({
     );
 
     // ========================================================================
+    // Dream Background Worker
+    // ========================================================================
+
+    let dreamWorkerTimer: ReturnType<typeof setInterval> | undefined;
+    let dreamWorkerBusy = false;
+    const dreamWorkerIntervalMs = 5_000;
+
+    const resolvePersistentDreamStateDir = () =>
+      pluginStateDir ?? resolveRuntimeStateDir();
+
+    const queueDreamJob = (
+      stateDir: string,
+      input: Parameters<typeof enqueueDreamJob>[1],
+    ) => enqueueDreamJob(stateDir, input);
+
+    const runDreamWorkerTick = async (reason: string) => {
+      if (dreamWorkerBusy) return;
+      const stateDir = resolvePersistentDreamStateDir();
+      if (!stateDir) return;
+
+      dreamWorkerBusy = true;
+      try {
+        const outcome = await drainDreamQueue(stateDir, {
+          api,
+          provider,
+          cfg,
+          captureEvent: _captureEvent,
+        });
+        if (outcome.processed === 0 && reason !== "interval") {
+          api.logger.debug(
+            `openclaw-mem0: dream worker idle (${reason}, stateDir=${stateDir})`,
+          );
+        }
+      } catch (err) {
+        api.logger.warn(
+          `openclaw-mem0: dream worker tick failed (${reason}): ${String(err)}`,
+        );
+      } finally {
+        dreamWorkerBusy = false;
+      }
+    };
+
+    // ========================================================================
     // Lifecycle Hooks
     // ========================================================================
 
@@ -331,6 +361,7 @@ const memoryPlugin = definePluginEntry({
         },
         getPluginStateDir: () => pluginStateDir,
         getRuntimeStateDir: resolveRuntimeStateDir,
+        queueDreamJob,
       },
       skillsActive,
       _captureEvent,
@@ -347,8 +378,16 @@ const memoryPlugin = definePluginEntry({
         api.logger.info(
           `openclaw-mem0: initialized (mode: ${cfg.mode}, user: ${cfg.userId}, autoRecall: ${cfg.autoRecall}, autoCapture: ${cfg.autoCapture}, stateDir: ${pluginStateDir ?? "none"})`,
         );
+        if (skillsActive && cfg.skills?.dream?.enabled !== false && cfg.skills?.dream?.auto !== false) {
+          dreamWorkerTimer = setInterval(() => {
+            void runDreamWorkerTick("interval");
+          }, dreamWorkerIntervalMs);
+          void runDreamWorkerTick("start");
+        }
       },
       stop: () => {
+        if (dreamWorkerTimer) clearInterval(dreamWorkerTimer);
+        dreamWorkerTimer = undefined;
         api.logger.info("openclaw-mem0: stopped");
       },
     });
@@ -404,6 +443,10 @@ function registerHooks(
     setCurrentSessionId: (id: string) => void;
     getPluginStateDir: () => string | undefined;
     getRuntimeStateDir: () => string;
+    queueDreamJob: (
+      stateDir: string,
+      input: Parameters<typeof enqueueDreamJob>[1],
+    ) => ReturnType<typeof enqueueDreamJob>;
   },
   skillsActive: boolean = false,
   _captureEvent: (
@@ -537,174 +580,11 @@ function registerHooks(
         );
       }
 
-      const sessionStateDir = session.getPluginStateDir();
-      const dreamStateResolution = resolveDreamStateDir(
-        sessionStateDir,
-        runtimeStateDir,
-      );
-      const resolvedDreamStateDir = dreamStateResolution.stateDir;
-
-      // Auto-dream: check CHEAP gates first (local file reads only).
-      // Only hit the API for memory count if time + session gates pass.
-      const dreamEnabled =
-        cfg.skills?.dream?.enabled !== false &&
-        cfg.skills?.dream?.auto !== false;
-      let dreamContext = "";
-      if (!dreamEnabled) {
-        return {
-          prependSystemContext: systemContext, // cached by provider
-          prependContext: recallContext, // per-turn dynamic
-        };
-      }
-
-      if (!resolvedDreamStateDir) {
-        logDreamDiagnostics(
-          api,
-          _captureEvent,
-          "skipped",
-          resolvedDreamStateDir,
-          {
-            reason: "missing_state_dir",
-            session_state_dir_present: Boolean(sessionStateDir),
-            plugin_state_dir_present: Boolean(sessionStateDir),
-            runtime_state_dir_present: Boolean(runtimeStateDir),
-            state_dir_source: dreamStateResolution.source,
-          },
-        );
-      } else if (isSubagent) {
-        logDreamDiagnostics(
-          api,
-          _captureEvent,
-          "skipped",
-          resolvedDreamStateDir,
-          {
-            reason: "subagent_session",
-            runtime_state_dir_present: Boolean(runtimeStateDir),
-            state_dir_source: dreamStateResolution.source,
-          },
-        );
-      } else {
-        try {
-          const cheapResult = checkCheapGates(
-            resolvedDreamStateDir,
-            cfg.skills?.dream ?? {},
-          );
-          if (!cheapResult.proceed) {
-            logDreamDiagnostics(
-              api,
-              _captureEvent,
-              "gate_skipped",
-              resolvedDreamStateDir,
-              {
-                reason: cheapResult.reason ?? "cheap_gate_failed",
-                state_dir_source: dreamStateResolution.source,
-                runtime_state_dir_present: Boolean(runtimeStateDir),
-              },
-            );
-          } else {
-            // Cheap gates passed. Now do the expensive memory count check.
-            const memories = await provider.getAll({
-              user_id: userId,
-              source: "OPENCLAW",
-            });
-            const memCount = Array.isArray(memories) ? memories.length : 0;
-            const memResult = checkMemoryGate(
-              memCount,
-              cfg.skills?.dream ?? {},
-            );
-            if (!memResult.pass) {
-              logDreamDiagnostics(
-                api,
-                _captureEvent,
-                "gate_skipped",
-                resolvedDreamStateDir,
-                {
-                  reason: memResult.reason ?? "memory_gate_failed",
-                  memory_count: memCount,
-                  runtime_state_dir_present: Boolean(runtimeStateDir),
-                  state_dir_source: dreamStateResolution.source,
-                },
-              );
-            } else if (!acquireDreamLock(resolvedDreamStateDir)) {
-              logDreamDiagnostics(
-                api,
-                _captureEvent,
-                "lock_busy",
-                resolvedDreamStateDir,
-                {
-                  memory_count: memCount,
-                  runtime_state_dir_present: Boolean(runtimeStateDir),
-                  state_dir_source: dreamStateResolution.source,
-                },
-              );
-            } else {
-              const dreamPrompt = loadDreamPrompt(cfg.skills ?? {});
-              if (dreamPrompt) {
-                const feedbackState = readDreamFeedbackState(resolvedDreamStateDir);
-                const analysis = analyzeMemoryInventory(
-                  memories as MemoryItem[],
-                  new Date(),
-                  feedbackState,
-                );
-                const dreamSummary = formatDreamSummary(analysis);
-                const dreamGroups = formatDreamGroups(analysis);
-                dreamContext =
-                  "\n\n<auto-dream>\nIMPORTANT: Before responding to the user, run a memory consolidation pass. Follow the protocol below, then respond normally.\n\n" +
-                  dreamSummary +
-                  "\n\n" +
-                  dreamGroups +
-                  "\n\n" +
-                  dreamPrompt +
-                  "\n</auto-dream>";
-                // Track which session triggered dream (session-keyed, not global)
-                dreamSessionId = sessionId;
-                dreamStateDir = resolvedDreamStateDir;
-                dreamStateSource = dreamStateResolution.source;
-                logDreamDiagnostics(api, _captureEvent, "triggered", resolvedDreamStateDir, {
-                  memory_count: memCount,
-                  groups: analysis.groupCount,
-                  stale_candidates: analysis.staleCandidateCount,
-                  delete_candidates: analysis.deleteCandidateCount,
-                  rewrite_candidates: analysis.rewriteCandidateCount,
-                  runtime_state_dir_present: Boolean(runtimeStateDir),
-                  state_dir_source: dreamStateResolution.source,
-                });
-              } else {
-                releaseDreamLock(resolvedDreamStateDir);
-                logDreamDiagnostics(
-                  api,
-                  _captureEvent,
-                  "prompt_missing",
-                  resolvedDreamStateDir,
-                  {
-                    memory_count: memCount,
-                    runtime_state_dir_present: Boolean(runtimeStateDir),
-                    state_dir_source: dreamStateResolution.source,
-                  },
-                );
-              }
-            }
-          }
-        } catch (err) {
-          logDreamDiagnostics(api, _captureEvent, "gate_error", resolvedDreamStateDir, {
-            error: String(err),
-            runtime_state_dir_present: Boolean(runtimeStateDir),
-            state_dir_source: dreamStateResolution.source,
-          });
-        }
-      }
-
       return {
         prependSystemContext: systemContext, // cached by provider
-        prependContext: recallContext + dreamContext, // per-turn dynamic
+        prependContext: recallContext, // per-turn dynamic
       };
     });
-
-    // Session-keyed dream tracking. Only the session that triggered dream
-    // can complete it. Prevents cross-session false completion.
-    let dreamSessionId: string | undefined;
-    let dreamStateDir: string | undefined;
-    let dreamStateSource: "session" | "plugin" | "runtime" | "none" = "none";
 
     api.on("agent_end", async (event: any, ctx: any) => {
       const sessionId = ctx?.sessionKey ?? undefined;
@@ -716,86 +596,12 @@ function registerHooks(
         sessionStateDir,
         runtimeStateDir,
       );
-      const effectiveDreamStateDir =
-        dreamStateResolution.stateDir ?? dreamStateDir;
-      const effectiveDreamStateSource =
-        dreamStateResolution.stateDir ? dreamStateResolution.source : dreamStateSource;
-
-      // If dream was triggered for THIS session, handle cleanup regardless
-      // of success/failure. A failed turn must still release the lock.
-      if (dreamSessionId && dreamSessionId === sessionId && effectiveDreamStateDir) {
-        dreamSessionId = undefined;
-        dreamStateDir = undefined;
-        dreamStateSource = "none";
-
-        if (!event.success) {
-          // Turn failed/aborted after lock acquired. Release lock, do not
-          // record completion. Gates will re-trigger next eligible turn.
-          releaseDreamLock(effectiveDreamStateDir);
-          logDreamDiagnostics(api, _captureEvent, "turn_failed", effectiveDreamStateDir, {
-            reason: "assistant_turn_failed",
-            runtime_state_dir_present: Boolean(runtimeStateDir),
-            state_dir_source: effectiveDreamStateSource,
-          });
-          return;
-        }
-
-        // Verify the model actually performed WRITE operations (not just reads).
-        // Only count memory_add, memory_update, memory_delete.
-        // Exclude memory_list and memory_search (read-only, orient-only pass).
-        // Scan only the LAST assistant message (this turn), not the full session
-        // snapshot, to avoid matching earlier tool calls from prior turns.
-        const WRITE_TOOLS = new Set([
-          "memory_add",
-          "memory_update",
-          "memory_delete",
-        ]);
-        const messages = event.messages ?? [];
-        // Find the last assistant message (this turn's output)
-        const lastAssistant = [...messages]
-          .reverse()
-          .find((m: any) => m.role === "assistant");
-        const writeToolUsed =
-          lastAssistant && Array.isArray(lastAssistant.content)
-            ? lastAssistant.content.some(
-                (block: any) =>
-                  block.type === "tool_use" && WRITE_TOOLS.has(block.name),
-              )
-            : false;
-
-        if (writeToolUsed) {
-          const feedbackRun = buildDreamFeedbackRun(lastAssistant, Date.now());
-          const feedbackState = recordDreamFeedback(effectiveDreamStateDir, feedbackRun);
-          releaseDreamLock(effectiveDreamStateDir);
-          recordDreamCompletion(effectiveDreamStateDir);
-          logDreamDiagnostics(api, _captureEvent, "completed", effectiveDreamStateDir, {
-            write_tools_used: true,
-            parsed_write_actions: feedbackRun.parsedWriteActions,
-            feedback_topics_count: feedbackRun.feedbackTopicsCount,
-            feedback_parse_complete: feedbackRun.parseComplete,
-            retained_runs: feedbackState.recentDreamRuns.length,
-            runtime_state_dir_present: Boolean(runtimeStateDir),
-            state_dir_source: effectiveDreamStateSource,
-          });
-        } else {
-          releaseDreamLock(effectiveDreamStateDir);
-          logDreamDiagnostics(api, _captureEvent, "no_write", effectiveDreamStateDir, {
-            reason: "no_write_tools_executed",
-            runtime_state_dir_present: Boolean(runtimeStateDir),
-            state_dir_source: effectiveDreamStateSource,
-          });
-        }
-        return;
-      }
+      const effectiveDreamStateDir = dreamStateResolution.stateDir;
+      const effectiveDreamStateSource = dreamStateResolution.source;
 
       if (!event.success) return;
 
-      // Track session for dream gating (interactive turns only)
-      if (
-        effectiveDreamStateDir &&
-        sessionId &&
-        !isNonInteractiveTrigger(trigger, sessionId)
-      ) {
+      if (effectiveDreamStateDir && sessionId && !isNonInteractiveTrigger(trigger, sessionId)) {
         const sessionUpdate = incrementSessionCount(
           effectiveDreamStateDir,
           sessionId,
@@ -810,6 +616,56 @@ function registerHooks(
           api.logger.info(
             `openclaw-mem0: auto-dream session counted (session=${sessionId}, sessions_since=${sessionUpdate.state.sessionsSince})`,
           );
+
+          const dreamEnabled =
+            cfg.skills?.dream?.enabled !== false &&
+            cfg.skills?.dream?.auto !== false;
+          if (dreamEnabled) {
+            const dreamGate = checkCheapGates(
+              effectiveDreamStateDir,
+              cfg.skills?.dream ?? {},
+            );
+            if (dreamGate.proceed) {
+              const enqueueResult = session.queueDreamJob(
+                effectiveDreamStateDir,
+                {
+                  userId: _effectiveUserId(sessionId),
+                  sessionId,
+                  stateDir: effectiveDreamStateDir,
+                  stateSource: effectiveDreamStateSource,
+                  reason: `sessions_since=${sessionUpdate.state.sessionsSince}`,
+                  priority: sessionUpdate.state.sessionsSince,
+                },
+              );
+              if (enqueueResult.enqueued) {
+                logDreamDiagnostics(api, _captureEvent, "enqueued", effectiveDreamStateDir, {
+                  job_id: enqueueResult.job?.id,
+                  user_id: _effectiveUserId(sessionId),
+                  session_id: sessionId,
+                  reason: `sessions_since=${sessionUpdate.state.sessionsSince}`,
+                  runtime_state_dir_present: Boolean(runtimeStateDir),
+                  state_dir_source: effectiveDreamStateSource,
+                });
+              } else {
+                logDreamDiagnostics(api, _captureEvent, "enqueue_skipped", effectiveDreamStateDir, {
+                  reason: enqueueResult.skippedReason ?? "duplicate_pending_or_running_job",
+                  job_id: enqueueResult.job?.id,
+                  user_id: _effectiveUserId(sessionId),
+                  session_id: sessionId,
+                  runtime_state_dir_present: Boolean(runtimeStateDir),
+                  state_dir_source: effectiveDreamStateSource,
+                });
+              }
+            } else {
+              logDreamDiagnostics(api, _captureEvent, "gate_skipped", effectiveDreamStateDir, {
+                reason: dreamGate.reason ?? "cheap_gate_failed",
+                user_id: _effectiveUserId(sessionId),
+                session_id: sessionId,
+                runtime_state_dir_present: Boolean(runtimeStateDir),
+                state_dir_source: effectiveDreamStateSource,
+              });
+            }
+          }
         }
       }
 
