@@ -113,6 +113,110 @@ const IDENTITY_QUERY_PATTERNS = [
   "称呼",
 ];
 
+const QUERY_NOISE_PHRASES = [
+  "还记得",
+  "记得",
+  "之前",
+  "上次",
+  "以前",
+  "刚才",
+  "刚刚",
+  "能否",
+  "可以",
+  "请问",
+  "帮我",
+  "帮忙",
+  "告诉我",
+  "问一下",
+  "想知道",
+  "麻烦",
+  "继续",
+  "然后",
+  "接着",
+  "还有",
+  "吗",
+  "嘛",
+  "吧",
+  "呢",
+  "呀",
+  "啊",
+  "么",
+  "什么",
+  "哪些",
+  "哪种",
+  "哪样",
+  "怎么",
+  "为何",
+  "为什么",
+  "如何",
+  "多少",
+  "几",
+  "谁",
+  "哪儿",
+  "哪里",
+];
+
+const PREFERENCE_HINTS = [
+  "喜欢吃",
+  "喜欢喝",
+  "喜欢",
+  "偏好",
+  "爱好",
+  "习惯",
+  "口味",
+  "爱吃",
+  "爱喝",
+];
+
+const IDENTITY_HINTS = [
+  "时区",
+  "timezone",
+  "location",
+  "name",
+  "称呼",
+];
+
+const RULE_HINTS = [
+  "规则",
+  "必须",
+  "禁止",
+  "不要",
+  "不能",
+  "always",
+  "never",
+];
+
+const DECISION_HINTS = [
+  "决定",
+  "选择",
+  "原因",
+  "rationale",
+  "why",
+  "picked",
+  "chose",
+];
+
+const CONFIG_HINTS = [
+  "配置",
+  "设置",
+  "怎么配",
+  "参数",
+  "版本",
+  "安装",
+  "修改",
+  "切换",
+];
+
+const PROJECT_HINTS = [
+  "项目",
+  "进度",
+  "状态",
+  "里程碑",
+  "milestone",
+  "project",
+  "task",
+];
+
 const CHARS_PER_TOKEN = 4;
 
 export interface RecallResult {
@@ -132,6 +236,24 @@ type RecallDecision =
   | { decision: "skip"; reason: string }
   | { decision: "long_term" }
   | { decision: "long_term_plus_session" };
+
+export type MemoryQueryIntent =
+  | "preference"
+  | "identity"
+  | "rule"
+  | "decision"
+  | "configuration"
+  | "project"
+  | "generic";
+
+export interface MemoryQueryAnalysis {
+  original: string;
+  cleaned: string;
+  rewritten: string;
+  intent: MemoryQueryIntent;
+  hasFirstPerson: boolean;
+  hasQuestionFrame: boolean;
+}
 
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / CHARS_PER_TOKEN);
@@ -163,6 +285,133 @@ function isLikelyCurrentTaskRequest(text: string): boolean {
 
 function wantsIdentityContext(text: string): boolean {
   return includesAny(text, IDENTITY_QUERY_PATTERNS);
+}
+
+function hasAnyHint(text: string, patterns: string[]): boolean {
+  return patterns.some((pattern) => text.includes(pattern.toLowerCase()));
+}
+
+function classifyMemoryQuery(normalized: string): MemoryQueryIntent {
+  if (hasAnyHint(normalized, PREFERENCE_HINTS)) return "preference";
+  if (hasAnyHint(normalized, IDENTITY_HINTS)) return "identity";
+  if (hasAnyHint(normalized, RULE_HINTS)) return "rule";
+  if (hasAnyHint(normalized, DECISION_HINTS)) return "decision";
+  if (hasAnyHint(normalized, CONFIG_HINTS)) return "configuration";
+  if (hasAnyHint(normalized, PROJECT_HINTS)) return "project";
+  return "generic";
+}
+
+function buildMemoryQueryTokens(
+  normalized: string,
+): { tokens: string[]; hasFirstPerson: boolean; hasQuestionFrame: boolean } {
+  const hasFirstPerson = /(?:我的|我|咱们|咱|本人|自己)/.test(normalized);
+  const hasQuestionFrame = /(?:吗|嘛|吧|呢|呀|啊|么|什么|哪些|哪种|哪样|怎么|为何|为什么|如何|多少|几|谁|哪儿|哪里)/.test(
+    normalized,
+  );
+
+  let working = normalized;
+  const orderedNoisePhrases = [...QUERY_NOISE_PHRASES].sort(
+    (a, b) => b.length - a.length,
+  );
+  for (const phrase of orderedNoisePhrases) {
+    working = working.split(phrase.toLowerCase()).join(" ");
+  }
+  working = working.replace(
+    /(?:我的|我|咱们|咱|本人|自己)/g,
+    " 用户 ",
+  );
+  working = working.replace(/[?？!！。.,，、；;:：/\\|()[\]{}"'`~\-]/g, " ");
+  working = working.replace(/\s+/g, " ").trim();
+
+  const tokens = new Set(
+    working
+      .split(" ")
+      .map((token) => token.trim())
+      .filter(Boolean),
+  );
+
+  if (hasFirstPerson) tokens.add("用户");
+  return { tokens: [...tokens], hasFirstPerson, hasQuestionFrame };
+}
+
+function addBridgeTerms(
+  tokens: Set<string>,
+  normalized: string,
+  intent: MemoryQueryIntent,
+): void {
+  if (intent === "preference") {
+    tokens.add("偏好");
+    if (/(喜欢吃|喜欢喝|爱吃|爱喝|吃什么|喝什么)/.test(normalized)) {
+      tokens.add("食物");
+    }
+    return;
+  }
+
+  if (intent === "identity") {
+    tokens.add("用户");
+    return;
+  }
+
+  if (intent === "rule") {
+    tokens.add("规则");
+    return;
+  }
+
+  if (intent === "decision") {
+    tokens.add("决定");
+    return;
+  }
+
+  if (intent === "configuration") {
+    tokens.add("配置");
+    return;
+  }
+
+  if (intent === "project") {
+    tokens.add("项目");
+  }
+}
+
+export function analyzeMemoryQuery(rawQuery: string): MemoryQueryAnalysis {
+  const cleaned = normalizeText(sanitizeQuery(rawQuery));
+  const normalized = cleaned.toLowerCase();
+  const { tokens, hasFirstPerson, hasQuestionFrame } =
+    buildMemoryQueryTokens(normalized);
+  const intent = classifyMemoryQuery(normalized);
+  const tokenSet = new Set(tokens);
+  addBridgeTerms(tokenSet, normalized, intent);
+
+  const rewritten = [...tokenSet]
+    .filter(Boolean)
+    .slice(0, 6)
+    .join(" ")
+    .trim();
+
+  return {
+    original: rawQuery,
+    cleaned,
+    rewritten: rewritten || cleaned || rawQuery.trim(),
+    intent,
+    hasFirstPerson,
+    hasQuestionFrame,
+  };
+}
+
+export function rewriteMemoryQuery(rawQuery: string): string {
+  return analyzeMemoryQuery(rawQuery).rewritten;
+}
+
+export function getAdaptiveSearchThreshold(
+  rawQuery: string,
+  baseThreshold: number,
+): number {
+  const { intent } = analyzeMemoryQuery(rawQuery);
+  if (intent === "preference") return Math.min(baseThreshold, 0.45);
+  if (intent === "identity") return Math.min(baseThreshold, 0.5);
+  if (intent === "rule" || intent === "decision" || intent === "configuration" || intent === "project") {
+    return Math.min(baseThreshold, 0.55);
+  }
+  return baseThreshold;
 }
 
 function hasHistoryIntent(text: string, patterns: string[]): boolean {
@@ -429,7 +678,10 @@ export async function recall(
     recallConfig.finalMaxMemories ??
     recallConfig.maxMemories ??
     DEFAULT_FINAL_MAX_MEMORIES;
-  const threshold = recallConfig.threshold ?? DEFAULT_THRESHOLD;
+  const threshold = getAdaptiveSearchThreshold(
+    query,
+    recallConfig.threshold ?? DEFAULT_THRESHOLD,
+  );
   const relativeScoreThreshold =
     recallConfig.relativeScoreThreshold ?? DEFAULT_RELATIVE_SCORE_THRESHOLD;
   const categoryOrder = recallConfig.categoryOrder ?? DEFAULT_CATEGORY_ORDER;
@@ -448,10 +700,11 @@ export async function recall(
   };
 
   const cleanQuery = sanitizeQuery(query);
+  const searchQuery = rewriteMemoryQuery(cleanQuery);
 
   let longTermMemories: MemoryItem[] = [];
   try {
-    longTermMemories = await provider.search(cleanQuery, searchOpts);
+    longTermMemories = await provider.search(searchQuery, searchOpts);
   } catch (err) {
     console.warn(
       "[mem0] Recall search failed:",
@@ -462,7 +715,7 @@ export async function recall(
   let sessionMemories: MemoryItem[] = [];
   if (sessionId) {
     try {
-      sessionMemories = await provider.search(cleanQuery, {
+      sessionMemories = await provider.search(searchQuery, {
         ...searchOpts,
         run_id: sessionId,
         top_k: Math.min(rawTopK, 5),

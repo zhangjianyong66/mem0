@@ -44,6 +44,8 @@ import {
 import {
   recall as skillRecall,
   sanitizeQuery,
+  getAdaptiveSearchThreshold,
+  rewriteMemoryQuery,
   shouldRecallLongTermMemory,
 } from "./recall.ts";
 import {
@@ -733,27 +735,33 @@ function registerHooks(
           "",
         )
         .trim();
+      const searchPrompt = rewriteMemoryQuery(cleanPrompt);
 
       const recallStart = Date.now();
       const recallWork = async () => {
         // Single search with a reasonable candidate pool
         const recallTopK = Math.max((cfg.topK ?? 5) * 2, 10);
+        const recallSearchOpts = buildSearchOptions(
+          undefined,
+          recallTopK,
+          undefined,
+          recallSessionKey,
+        );
+        recallSearchOpts.threshold = getAdaptiveSearchThreshold(
+          cleanPrompt,
+          Math.max(cfg.searchThreshold, 0.6),
+        );
 
         // Search long-term memories (user-scoped; subagents read from parent namespace)
         let longTermResults = await provider.search(
-          cleanPrompt,
-          buildSearchOptions(
-            undefined,
-            recallTopK,
-            undefined,
-            recallSessionKey,
-          ),
+          searchPrompt,
+          recallSearchOpts,
         );
 
-        // Client-side threshold filter for auto-recall — use a stricter
-        // threshold (0.6) than explicit tool searches (0.5) to avoid
-        // injecting irrelevant memories into agent context
-        const recallThreshold = Math.max(cfg.searchThreshold, 0.6);
+        // Client-side threshold filter for auto-recall — start from a stricter
+        // baseline, then relax it only for high-signal preference / identity /
+        // config queries so recall stays conservative overall.
+        const recallThreshold = recallSearchOpts.threshold ?? cfg.searchThreshold;
         longTermResults = longTermResults.filter(
           (r) => (r.score ?? 0) >= recallThreshold,
         );

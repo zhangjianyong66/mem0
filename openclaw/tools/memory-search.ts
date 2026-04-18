@@ -1,6 +1,10 @@
 import { Type } from "@sinclair/typebox";
 import type { MemoryItem, SearchOptions } from "../types.ts";
 import type { ToolDeps } from "./index.ts";
+import {
+  getAdaptiveSearchThreshold,
+  rewriteMemoryQuery,
+} from "../recall.ts";
 
 export function createMemorySearchTool(deps: ToolDeps) {
   const { cfg, provider, resolveUserId, buildSearchOptions, getCurrentSessionId } = deps;
@@ -38,24 +42,41 @@ export function createMemorySearchTool(deps: ToolDeps) {
         let results: MemoryItem[] = [];
         const uid = resolveUserId({ agentId, userId });
         const currentSessionId = getCurrentSessionId();
+        const searchQuery = rewriteMemoryQuery(query);
 
         const applyFilters = (opts: SearchOptions): SearchOptions => {
           if (filterCategories?.length) opts.categories = filterCategories;
           if (agentFilters) opts.filters = agentFilters;
+          opts.threshold = getAdaptiveSearchThreshold(
+            query,
+            opts.threshold ?? cfg.searchThreshold,
+          );
           return opts;
         };
 
         if (scope === "session") {
           if (currentSessionId) {
-            results = await provider.search(query, applyFilters(buildSearchOptions(uid, limit, currentSessionId)));
+            results = await provider.search(
+              searchQuery,
+              applyFilters(buildSearchOptions(uid, limit, currentSessionId)),
+            );
           }
         } else if (scope === "long-term") {
-          results = await provider.search(query, applyFilters(buildSearchOptions(uid, limit)));
+          results = await provider.search(
+            searchQuery,
+            applyFilters(buildSearchOptions(uid, limit)),
+          );
         } else {
-          const longTerm = await provider.search(query, applyFilters(buildSearchOptions(uid, limit)));
+          const longTerm = await provider.search(
+            searchQuery,
+            applyFilters(buildSearchOptions(uid, limit)),
+          );
           let session: MemoryItem[] = [];
           if (currentSessionId) {
-            session = await provider.search(query, applyFilters(buildSearchOptions(uid, limit, currentSessionId)));
+            session = await provider.search(
+              searchQuery,
+              applyFilters(buildSearchOptions(uid, limit, currentSessionId)),
+            );
           }
           const seen = new Set(longTerm.map((r) => r.id));
           results = [...longTerm, ...session.filter((r) => !seen.has(r.id))];

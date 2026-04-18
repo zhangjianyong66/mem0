@@ -1,5 +1,9 @@
 import { Type } from "@sinclair/typebox";
 import { isSubagentSession } from "../isolation.ts";
+import {
+  getAdaptiveSearchThreshold,
+  rewriteMemoryQuery,
+} from "../recall.ts";
 import type { ToolDeps } from "./index.ts";
 
 export function createMemoryDeleteTool(deps: ToolDeps) {
@@ -38,7 +42,13 @@ export function createMemoryDeleteTool(deps: ToolDeps) {
 
         if (query) {
           const uid = resolveUserId({ agentId, userId });
-          const results = await provider.search(query, buildSearchOptions(uid, 5));
+          const searchQuery = rewriteMemoryQuery(query);
+          const searchOptions = buildSearchOptions(uid, 5);
+          searchOptions.threshold = getAdaptiveSearchThreshold(
+            query,
+            searchOptions.threshold ?? 0.5,
+          );
+          const results = await provider.search(searchQuery, searchOptions);
           if (!results || results.length === 0) {
             return { content: [{ type: "text", text: "No matching memories found." }], details: { found: 0 } };
           }

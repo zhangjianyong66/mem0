@@ -17,6 +17,7 @@ import { createMemoryListTool } from "../tools/memory-list.ts";
 import { createMemoryUpdateTool } from "../tools/memory-update.ts";
 import { createMemoryEventListTool } from "../tools/memory-event-list.ts";
 import { createMemoryEventStatusTool } from "../tools/memory-event-status.ts";
+import { rewriteMemoryQuery } from "../recall.ts";
 
 // ---------------------------------------------------------------------------
 // Mock helper
@@ -173,6 +174,35 @@ describe("memory_search execute", () => {
     expect(result.details.count).toBe(1);
     expect(result.details.memories).toHaveLength(1);
     expect(result.details.memories[0].id).toBe("m1");
+  });
+
+  it("rewrites preference queries before calling provider.search", async () => {
+    const searchMock = vi
+      .fn()
+      .mockResolvedValue([{ id: "m1", memory: "preference memory", score: 0.48 }]);
+    const ctx = createMockToolDeps({
+      provider: {
+        search: searchMock,
+        add: vi.fn(),
+        getAll: vi.fn(),
+        update: vi.fn(),
+        delete: vi.fn(),
+        get: vi.fn(),
+        history: vi.fn(),
+      },
+    });
+    const tool = createMemorySearchTool(ctx);
+
+    await tool.execute("call-pref", {
+      query: "还记得我喜欢吃什么吗",
+    });
+
+    expect(searchMock).toHaveBeenCalledWith(
+      rewriteMemoryQuery("还记得我喜欢吃什么吗"),
+      expect.objectContaining({
+        threshold: 0.45,
+      }),
+    );
   });
 
   it("returns 'no relevant memories' when provider returns empty", async () => {

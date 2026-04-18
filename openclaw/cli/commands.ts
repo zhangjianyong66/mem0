@@ -47,6 +47,10 @@ import { readDreamFeedbackState } from "../dream-feedback.ts";
 import { getDreamLockInfo, getDreamState } from "../dream-gate.ts";
 import { listDreamJobs } from "../dream-queue.ts";
 import { readText } from "../fs-safe.ts";
+import {
+  getAdaptiveSearchThreshold,
+  rewriteMemoryQuery,
+} from "../recall.ts";
 import type { PluginAuthConfig } from "./config-file.ts";
 import {
   readPluginAuth,
@@ -668,6 +672,7 @@ export function registerCliCommands(
                 : opts.agentId
                   ? agentUserId(opts.agentId)
                   : effectiveUserId(currentSessionId);
+              const searchQuery = rewriteMemoryQuery(query);
 
               // CLI search: no source filter so users find ALL memories
               const cliSearchOpts = (
@@ -677,6 +682,7 @@ export function registerCliCommands(
               ): SearchOptions => {
                 const base = buildSearchOptions(userIdOverride, lim, runId);
                 base.threshold = 0.3;
+                base.threshold = getAdaptiveSearchThreshold(query, base.threshold);
                 return base;
               };
 
@@ -685,7 +691,7 @@ export function registerCliCommands(
               if (scope === "session" || scope === "all") {
                 if (currentSessionId) {
                   const sessionResults = await provider.search(
-                    query,
+                    searchQuery,
                     cliSearchOpts(uid, limit, currentSessionId),
                   );
                   if (sessionResults?.length) {
@@ -706,7 +712,7 @@ export function registerCliCommands(
 
               if (scope === "long-term" || scope === "all") {
                 const longTermResults = await provider.search(
-                  query,
+                  searchQuery,
                   cliSearchOpts(uid, limit),
                 );
                 if (longTermResults?.length) {

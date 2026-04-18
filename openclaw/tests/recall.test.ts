@@ -1,8 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Mem0Provider, MemoryItem } from "../types.ts";
 import {
+  analyzeMemoryQuery,
+  getAdaptiveSearchThreshold,
   recall,
   sanitizeQuery,
+  rewriteMemoryQuery,
   shouldRecallLongTermMemory,
 } from "../recall.ts";
 
@@ -25,6 +28,25 @@ describe("sanitizeQuery", () => {
       'Sender (untrusted metadata): ```json\n{"name":"x"}\n```\n继续分析这个配置',
     );
     expect(query).toBe("继续分析这个配置");
+  });
+});
+
+describe("rewriteMemoryQuery", () => {
+  it("rewrites first-person preference questions into search keywords", () => {
+    const analysis = analyzeMemoryQuery("还记得我喜欢吃什么吗");
+    expect(analysis.intent).toBe("preference");
+    expect(analysis.hasFirstPerson).toBe(true);
+    expect(analysis.hasQuestionFrame).toBe(true);
+    expect(analysis.rewritten).toBe("用户 喜欢吃 偏好 食物");
+    expect(rewriteMemoryQuery("还记得我喜欢吃什么吗")).toBe(
+      "用户 喜欢吃 偏好 食物",
+    );
+  });
+});
+
+describe("getAdaptiveSearchThreshold", () => {
+  it("lowers preference queries below the default auto-recall threshold", () => {
+    expect(getAdaptiveSearchThreshold("还记得我喜欢吃什么吗", 0.6)).toBe(0.45);
   });
 });
 
@@ -57,6 +79,36 @@ describe("shouldRecallLongTermMemory", () => {
 });
 
 describe("recall", () => {
+  it("rewrites queries before search and applies preference-friendly thresholds", async () => {
+    const provider = makeProvider([
+      {
+        id: "1",
+        memory: "用户喜欢吃芒果、凤梨和哈密瓜，其中芒果是心头好。",
+        score: 0.48,
+        metadata: { category: "preference" },
+      },
+    ]);
+
+    const result = await recall(
+      provider,
+      "还记得我喜欢吃什么吗",
+      "zhangjianyong",
+      {
+        recall: {
+          threshold: 0.6,
+        },
+      },
+    );
+
+    expect(provider.search).toHaveBeenCalledWith(
+      "用户 喜欢吃 偏好 食物",
+      expect.objectContaining({
+        threshold: 0.45,
+      }),
+    );
+    expect(result.memories).toHaveLength(1);
+  });
+
   it("deduplicates same-topic memories and emits summarized sections", async () => {
     const provider = makeProvider([
       {
