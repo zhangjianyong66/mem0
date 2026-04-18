@@ -1,10 +1,7 @@
 import { Type } from "@sinclair/typebox";
 import type { MemoryItem, SearchOptions } from "../types.ts";
 import type { ToolDeps } from "./index.ts";
-import {
-  getAdaptiveSearchThreshold,
-  rewriteMemoryQuery,
-} from "../recall.ts";
+import { sanitizeQuery } from "../recall.ts";
 
 export function createMemorySearchTool(deps: ToolDeps) {
   const { cfg, provider, resolveUserId, buildSearchOptions, getCurrentSessionId } = deps;
@@ -42,15 +39,12 @@ export function createMemorySearchTool(deps: ToolDeps) {
         let results: MemoryItem[] = [];
         const uid = resolveUserId({ agentId, userId });
         const currentSessionId = getCurrentSessionId();
-        const searchQuery = rewriteMemoryQuery(query);
+        const searchQuery = sanitizeQuery(query);
 
         const applyFilters = (opts: SearchOptions): SearchOptions => {
           if (filterCategories?.length) opts.categories = filterCategories;
           if (agentFilters) opts.filters = agentFilters;
-          opts.threshold = getAdaptiveSearchThreshold(
-            query,
-            opts.threshold ?? cfg.searchThreshold,
-          );
+          opts.threshold = opts.threshold ?? cfg.searchThreshold;
           return opts;
         };
 

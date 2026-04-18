@@ -44,8 +44,6 @@ import {
 import {
   recall as skillRecall,
   sanitizeQuery,
-  getAdaptiveSearchThreshold,
-  rewriteMemoryQuery,
   shouldRecallLongTermMemory,
 } from "./recall.ts";
 import {
@@ -110,6 +108,147 @@ export function resolveDreamStateDir(
     return { stateDir: runtimeStateDir, source: "runtime" };
   }
   return { source: "none" };
+}
+
+function extractTextFromPromptContent(content: unknown): string | undefined {
+  if (typeof content === "string") {
+    const trimmed = content.trim();
+    return trimmed || undefined;
+  }
+  if (!Array.isArray(content)) {
+    return undefined;
+  }
+  const text = content
+    .flatMap((part) => {
+      if (!part || typeof part !== "object") return [];
+      if (!("type" in part) || !("text" in part)) return [];
+      const record = part as { type?: unknown; text?: unknown };
+      if (
+        record.type !== "text" &&
+        record.type !== "input_text" &&
+        record.type !== "output_text"
+      ) {
+        return [];
+      }
+      return typeof record.text === "string" ? [record.text] : [];
+    })
+    .join("\n")
+    .trim();
+  return text || undefined;
+}
+
+type AutoRecallQuerySource = "prompt" | "messages" | "fallback";
+
+export interface AutoRecallQueryResolution {
+  query: string;
+  source: AutoRecallQuerySource;
+}
+
+const NON_USER_QUERY_PATTERNS = [
+  "read heartbeat.md if it exists",
+  "a new session was started",
+  "session startup sequence",
+  "/new or /reset",
+  "run your session",
+];
+
+function stripInjectedMemoryBlocks(text: string): string {
+  return text
+    .replace(/<recalled-memories>[\s\S]*?<\/recalled-memories>\s*/gi, "")
+    .replace(/<relevant-memories>[\s\S]*?<\/relevant-memories>\s*/gi, "");
+}
+
+function stripSenderMetadata(text: string): string {
+  return text.replace(
+    /Sender\s*\(untrusted metadata\):\s*```json[\s\S]*?```\s*/gi,
+    "",
+  );
+}
+
+function stripLeadingBracketPrefix(text: string): string {
+  return text.replace(/^\[[^\]\n]*\]\s*/g, "").trim();
+}
+
+function extractTimestampedUserText(text: string): string | undefined {
+  const timestampPattern = /\[[^\]\n]*\d{4}[^\]\n]*GMT[^\]\n]*\]\s*/gi;
+  let match: RegExpExecArray | null = null;
+  let lastMatch: RegExpExecArray | null = null;
+  while ((match = timestampPattern.exec(text)) !== null) {
+    lastMatch = match;
+  }
+  if (!lastMatch) return undefined;
+  const candidate = text.slice(lastMatch.index + lastMatch[0].length).trim();
+  return candidate || undefined;
+}
+
+function isNonUserRecallQuery(text: string): boolean {
+  const normalized = text.replace(/\s+/g, " ").trim().toLowerCase();
+  if (!normalized) return true;
+  return NON_USER_QUERY_PATTERNS.some((pattern) =>
+    normalized.includes(pattern),
+  );
+}
+
+function cleanAutoRecallQueryCandidate(
+  rawText: string,
+  options: { allowPlainText: boolean },
+): string | undefined {
+  const withoutBlocks = stripInjectedMemoryBlocks(rawText);
+  const withoutSender = stripSenderMetadata(withoutBlocks).trim();
+  const timestamped = extractTimestampedUserText(withoutSender);
+  const candidate = timestamped ?? (options.allowPlainText ? withoutSender : "");
+  const cleaned = stripLeadingBracketPrefix(sanitizeQuery(candidate)).trim();
+  if (isNonUserRecallQuery(cleaned)) return undefined;
+  return cleaned;
+}
+
+export function resolveAutoRecallQueryDetails(
+  prompt: string,
+  messages?: unknown[],
+): AutoRecallQueryResolution {
+  const promptQuery = cleanAutoRecallQueryCandidate(prompt, {
+    allowPlainText: false,
+  });
+  if (promptQuery) {
+    return { query: promptQuery, source: "prompt" };
+  }
+
+  if (Array.isArray(messages)) {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const message = messages[i];
+      if (!message || typeof message !== "object" || Array.isArray(message)) {
+        continue;
+      }
+      const record = message as { role?: unknown; content?: unknown };
+      if (record.role !== "user") continue;
+      const text = extractTextFromPromptContent(record.content);
+      if (!text) continue;
+      const query = cleanAutoRecallQueryCandidate(text, {
+        allowPlainText: true,
+      });
+      if (query) {
+        return { query, source: "messages" };
+      }
+    }
+  }
+
+  const fallbackQuery =
+    cleanAutoRecallQueryCandidate(prompt, { allowPlainText: true }) ?? "";
+  return { query: fallbackQuery, source: "fallback" };
+}
+
+export function resolveAutoRecallQuery(
+  prompt: string,
+  messages?: unknown[],
+): string {
+  return resolveAutoRecallQueryDetails(prompt, messages).query;
+}
+
+function previewForLog(text: unknown, max = 120): string {
+  if (typeof text !== "string") return "";
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= max) return normalized;
+  return `${normalized.slice(0, max)}...`;
 }
 
 // ============================================================================
@@ -466,9 +605,9 @@ function registerHooks(
     //
     // NOTE: We previously used a shared `lastCleanUserMessage` variable populated
     // by message_received to get clean user content. That variable was process-global
-    // mutable state vulnerable to cross-session races. Removed in favor of using
-    // sanitizeQuery() on event.prompt within this hook, where ctx.sessionKey is
-    // available and the execution is scoped to the correct session.
+    // mutable state vulnerable to cross-session races. Removed in favor of resolving
+    // the latest user message from event.messages inside this hook, where ctx.sessionKey
+    // is available and the execution is scoped to the correct session.
     api.on("before_prompt_build", async (event: any, ctx: any) => {
       if (!event.prompt || event.prompt.length < 5) return;
 
@@ -522,18 +661,31 @@ function registerHooks(
       if (recallEnabled && recallStrategy !== "manual") {
         const recallStart = Date.now();
         try {
-          const query = sanitizeQuery(event.prompt);
+          const queryResolution = resolveAutoRecallQueryDetails(
+            event.prompt,
+            event.messages,
+          );
+          const query = queryResolution.query;
           const recallGate = shouldRecallLongTermMemory(query, cfg.skills ?? {});
+          const recallLogBase = {
+            strategy: recallStrategy,
+            query_source: queryResolution.source,
+            raw_prompt_preview: previewForLog(event.prompt),
+            resolved_query_preview: previewForLog(query),
+            query_length: query.length,
+            gate_decision: recallGate.decision,
+            session_id_present: Boolean(sessionId),
+            is_subagent: isSubagent,
+          };
 
           if (recallGate.decision === "skip") {
             api.logger.info(
-              `openclaw-mem0: skills-mode recall skipped (${recallGate.reason})`,
+              `openclaw-mem0: skills-mode recall skipped (${recallGate.reason}, strategy=${recallStrategy}, query_source=${queryResolution.source}, gate_decision=skip, query_length=${query.length}, raw_prompt_preview="${previewForLog(event.prompt)}", resolved_query_preview="${previewForLog(query)}", session_id_present=${Boolean(sessionId)}, is_subagent=${isSubagent})`,
             );
             _captureEvent("openclaw.hook.recall", {
-              strategy: recallStrategy,
+              ...recallLogBase,
               decision: "skip",
               skip_reason: recallGate.reason,
-              query_length: query.length,
               latency_ms: Date.now() - recallStart,
             });
           } else {
@@ -555,14 +707,17 @@ function registerHooks(
             );
 
             api.logger.info(
-              `openclaw-mem0: skills-mode recall (strategy=${recallStrategy}, decision=${recallGate.decision}) injecting ${recallResult.memories.length} memories (~${recallResult.tokenEstimate} tokens, raw=${recallResult.debug.rawCandidateCount}, thresholded=${recallResult.debug.postThresholdCount}, deduped=${recallResult.debug.postDedupeCount})`,
+              `openclaw-mem0: skills-mode recall (strategy=${recallStrategy}, decision=${recallGate.decision}, query_source=${queryResolution.source}, gate_decision=${recallGate.decision}, query_length=${query.length}, raw_prompt_preview="${previewForLog(event.prompt)}", resolved_query_preview="${previewForLog(query)}", search_query_preview="${previewForLog(recallResult.debug.searchQuery)}", threshold=${recallResult.debug.threshold}, raw_top_k=${recallResult.debug.rawTopK}, session_search=${recallResult.debug.sessionSearchEnabled}, session_id_present=${Boolean(sessionId)}, is_subagent=${isSubagent}) injecting ${recallResult.memories.length} memories (~${recallResult.tokenEstimate} tokens, raw=${recallResult.debug.rawCandidateCount}, thresholded=${recallResult.debug.postThresholdCount}, deduped=${recallResult.debug.postDedupeCount})`,
             );
 
             _captureEvent("openclaw.hook.recall", {
-              strategy: recallStrategy,
+              ...recallLogBase,
               decision: recallGate.decision,
               memory_count: recallResult.memories.length,
-              query_length: query.length,
+              search_query_preview: previewForLog(recallResult.debug.searchQuery),
+              threshold: recallResult.debug.threshold,
+              raw_top_k: recallResult.debug.rawTopK,
+              session_search: recallResult.debug.sessionSearchEnabled,
               raw_candidate_count: recallResult.debug.rawCandidateCount,
               post_threshold_count: recallResult.debug.postThresholdCount,
               post_dedupe_count: recallResult.debug.postDedupeCount,
@@ -717,9 +872,6 @@ function registerHooks(
       // Update shared state for tools (best-effort — tools don't have ctx)
       if (sessionId) session.setCurrentSessionId(sessionId);
 
-      // Detect actual new session (first turn with a different sessionKey)
-      const isNewSession =
-        sessionId !== undefined && sessionId !== lastRecallSessionId;
       if (sessionId) lastRecallSessionId = sessionId;
 
       // Subagents have ephemeral UUIDs — their namespace is always empty.
@@ -729,13 +881,10 @@ function registerHooks(
       const recallSessionKey = isSubagent ? undefined : sessionId;
 
       // Strip OpenClaw sender metadata from the prompt before searching
-      const cleanPrompt = event.prompt
-        .replace(
-          /Sender\s*\(untrusted metadata\):\s*```json[\s\S]*?```\s*/gi,
-          "",
-        )
-        .trim();
-      const searchPrompt = rewriteMemoryQuery(cleanPrompt);
+      const searchPrompt = resolveAutoRecallQuery(
+        event.prompt,
+        event.messages,
+      );
 
       const recallStart = Date.now();
       const recallWork = async () => {
@@ -747,10 +896,7 @@ function registerHooks(
           undefined,
           recallSessionKey,
         );
-        recallSearchOpts.threshold = getAdaptiveSearchThreshold(
-          cleanPrompt,
-          Math.max(cfg.searchThreshold, 0.6),
-        );
+        recallSearchOpts.threshold = Math.max(cfg.searchThreshold, 0.5);
 
         // Search long-term memories (user-scoped; subagents read from parent namespace)
         let longTermResults = await provider.search(
@@ -758,9 +904,8 @@ function registerHooks(
           recallSearchOpts,
         );
 
-        // Client-side threshold filter for auto-recall — start from a stricter
-        // baseline, then relax it only for high-signal preference / identity /
-        // config queries so recall stays conservative overall.
+        // Client-side threshold filter for auto-recall keeps a conservative
+        // baseline so weak matches do not flood the context.
         const recallThreshold = recallSearchOpts.threshold ?? cfg.searchThreshold;
         longTermResults = longTermResults.filter(
           (r) => (r.score ?? 0) >= recallThreshold,
@@ -774,28 +919,6 @@ function registerHooks(
             longTermResults = longTermResults.filter(
               (r) => (r.score ?? 0) >= topScore * 0.5,
             );
-          }
-        }
-
-        // Only broaden for genuinely new sessions with short prompts
-        // (cold-start blindness). Skip on subsequent turns to save API calls.
-        if (isNewSession && cleanPrompt.length < 100) {
-          const broadOpts = buildSearchOptions(
-            undefined,
-            5,
-            undefined,
-            recallSessionKey,
-          );
-          broadOpts.threshold = 0.5;
-          const broadResults = await provider.search(
-            "recent decisions, preferences, active projects, and configuration",
-            broadOpts,
-          );
-          const existingIds = new Set(longTermResults.map((r) => r.id));
-          for (const r of broadResults) {
-            if (!existingIds.has(r.id)) {
-              longTermResults.push(r);
-            }
           }
         }
 

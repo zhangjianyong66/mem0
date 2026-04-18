@@ -149,6 +149,26 @@ function readSkillFile(skillName: string): string | null {
   }
 }
 
+function readSkillMarkdown(
+  skillName: string,
+  fileName: string,
+  targetSkill?: string,
+): string | null {
+  const filePath = safePath(skillName, fileName);
+  if (!filePath) return null;
+  try {
+    const content = readText(filePath);
+    const parsed = parseSkillFile(content);
+    const appliesTo = parsed.frontmatter.applies_to;
+    if (targetSkill && appliesTo && appliesTo !== targetSkill) {
+      return null;
+    }
+    return parsed.body;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Read a domain overlay, scoped to a specific skill.
  * Domain overlays live inside the skill directory: <skill>/domains/<domain>.md
@@ -372,23 +392,24 @@ export function loadTriagePrompt(config: SkillsConfig = {}): string {
         parts.push("");
       }
 
-      parts.push(
-        "When calling memory_search, ALWAYS rewrite the query. NEVER pass the user's raw message.",
+      const recallProtocol = readSkillMarkdown(
+        "memory-triage",
+        "recall-protocol.md",
+        "memory-triage",
       );
-      parts.push(
-        "Stored memories are third-person factual statements. Write a query that matches storage language, not conversation language.",
-      );
-      parts.push(
-        "Process: (1) Name your target. (2) Extract signal: proper nouns, technical terms, domain concepts. (3) Bridge to storage language: add terms the stored memory contains (user, decided, prefers, rule, configured, based in). (4) Compose 3-6 keywords.",
-      );
-      parts.push(
-        'WRONG: memory_search("Who was that nutritionist my wife recommended?")',
-      );
-      parts.push(
-        'RIGHT: memory_search("nutritionist wife recommended relationship")',
-      );
-      parts.push('WRONG: memory_search("What timezone am I in?")');
-      parts.push('RIGHT: memory_search("user timezone location based")');
+      if (recallProtocol) {
+        parts.push(recallProtocol);
+      } else {
+        parts.push(
+          "When calling memory_search, use the user's wording with minimal cleanup only. Do not add bridge terms or rewrite the question into storage language.",
+        );
+        parts.push(
+          "Stored memories are third-person factual statements. Keep the search query close to the user's wording; strip filler and metadata, but do not invent category words like preference, rule, configuration, or decision unless they are already present.",
+        );
+        parts.push(
+          "Process: (1) Name your target. (2) Extract signal: proper nouns, technical terms, domain concepts. (3) Keep the original phrasing or a lightly cleaned version. (4) Only use explicit filters when the user asks for a specific category or date range.",
+        );
+      }
       parts.push("");
       parts.push(
         "ENTITY SCOPING: Memories are scoped by user_id, agent_id, and run_id. You do not need to pass these in most cases. The plugin handles scoping automatically based on the current session.",
@@ -420,7 +441,7 @@ export function loadTriagePrompt(config: SkillsConfig = {}): string {
       parts.push("Using a specific scope avoids unnecessary backend fan-out.");
       parts.push("");
       parts.push(
-        "SEARCH FILTERS: When the user's intent implies a time range or category constraint, pass a `filters` object alongside your rewritten query.",
+        "SEARCH FILTERS: When the user's intent implies a time range or category constraint, pass a `filters` object alongside your cleaned query.",
       );
       parts.push(
         '- Time: "last week" -> filters: {"created_at": {"gte": "2026-03-24"}}',
@@ -458,7 +479,7 @@ export function loadTriagePrompt(config: SkillsConfig = {}): string {
   );
   if (config.recall?.enabled !== false) {
     parts.push(
-      "When searching, rewrite queries for retrieval. Do not pass raw user messages.",
+      "When searching, use the user's wording with minimal cleanup only. Do not add bridge terms or rewrite the question into storage language.",
     );
   }
   parts.push("</memory-system>");

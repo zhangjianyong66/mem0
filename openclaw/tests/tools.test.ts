@@ -17,7 +17,6 @@ import { createMemoryListTool } from "../tools/memory-list.ts";
 import { createMemoryUpdateTool } from "../tools/memory-update.ts";
 import { createMemoryEventListTool } from "../tools/memory-event-list.ts";
 import { createMemoryEventStatusTool } from "../tools/memory-event-status.ts";
-import { rewriteMemoryQuery } from "../recall.ts";
 
 // ---------------------------------------------------------------------------
 // Mock helper
@@ -176,7 +175,7 @@ describe("memory_search execute", () => {
     expect(result.details.memories[0].id).toBe("m1");
   });
 
-  it("rewrites preference queries before calling provider.search", async () => {
+  it("passes the cleaned raw query to provider.search", async () => {
     const searchMock = vi
       .fn()
       .mockResolvedValue([{ id: "m1", memory: "preference memory", score: 0.48 }]);
@@ -198,9 +197,9 @@ describe("memory_search execute", () => {
     });
 
     expect(searchMock).toHaveBeenCalledWith(
-      rewriteMemoryQuery("还记得我喜欢吃什么吗"),
+      "还记得我喜欢吃什么吗",
       expect.objectContaining({
-        threshold: 0.45,
+        threshold: 0.5,
       }),
     );
   });

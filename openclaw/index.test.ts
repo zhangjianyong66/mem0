@@ -9,6 +9,8 @@ import {
   agentUserId,
   resolveUserId,
   resolveDreamStateDir,
+  resolveAutoRecallQuery,
+  resolveAutoRecallQueryDetails,
   isNonInteractiveTrigger,
   isSubagentSession,
   isNoiseMessage,
@@ -185,6 +187,112 @@ describe("resolveDreamStateDir", () => {
     expect(resolveDreamStateDir(undefined, undefined, undefined)).toEqual({
       source: "none",
     });
+  });
+});
+
+describe("resolveAutoRecallQuery", () => {
+  it("prefers the last user message over the full prompt", () => {
+    const query = resolveAutoRecallQuery(
+      "system scaffold\n\n你还记得我喜欢吃什么食物吗",
+      [
+        { role: "system", content: "system scaffold" },
+        { role: "assistant", content: "ack" },
+        { role: "user", content: "你还记得我喜欢吃什么食物吗" },
+      ],
+    );
+
+    expect(query).toBe("你还记得我喜欢吃什么食物吗");
+  });
+
+  it("prefers timestamped current prompt text over stale heartbeat messages", () => {
+    const query = resolveAutoRecallQuery(
+      `<recalled-memories>
+Relevant stored memories for "zhangjianyong":
+Projects:
+- User has a tool named OpenClaw.
+</recalled-memories>
+
+Sender (untrusted metadata):
+\`\`\`json
+{"label":"openclaw-control-ui","id":"openclaw-control-ui"}
+\`\`\`
+
+[Sat 2026-04-18 13:28 GMT+8] 食物 喜欢 吃`,
+      [
+        {
+          role: "user",
+          content:
+            "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly.",
+        },
+      ],
+    );
+
+    expect(query).toBe("食物 喜欢 吃");
+  });
+
+  it("reports prompt as the source for timestamped current prompt text", () => {
+    const resolution = resolveAutoRecallQueryDetails(
+      `Sender (untrusted metadata):
+\`\`\`json
+{"label":"openclaw-control-ui","id":"openclaw-control-ui"}
+\`\`\`
+
+[Sat 2026-04-18 13:28 GMT+8] 食物 喜欢 吃`,
+      [
+        {
+          role: "user",
+          content:
+            "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly.",
+        },
+      ],
+    );
+
+    expect(resolution).toEqual({
+      query: "食物 喜欢 吃",
+      source: "prompt",
+    });
+  });
+
+  it("skips heartbeat messages and uses the previous real user message", () => {
+    const resolution = resolveAutoRecallQueryDetails("agent prompt scaffold", [
+      { role: "user", content: "你还记得我喜欢吃什么食物吗" },
+      {
+        role: "user",
+        content:
+          "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly.",
+      },
+    ]);
+
+    expect(resolution).toEqual({
+      query: "你还记得我喜欢吃什么食物吗",
+      source: "messages",
+    });
+  });
+
+  it("returns an empty fallback query when only heartbeat text is available", () => {
+    const resolution = resolveAutoRecallQueryDetails(
+      "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly.",
+      [
+        {
+          role: "user",
+          content:
+            "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly.",
+        },
+      ],
+    );
+
+    expect(resolution).toEqual({
+      query: "",
+      source: "fallback",
+    });
+  });
+
+  it("falls back to the prompt when no user message is present", () => {
+    const query = resolveAutoRecallQuery("  [x] 继续分析这个配置  ", [
+      { role: "assistant", content: "ack" },
+    ]);
+
+    expect(query).toBe("继续分析这个配置");
   });
 });
 

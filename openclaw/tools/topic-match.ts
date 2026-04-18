@@ -1,13 +1,42 @@
 import type { MemoryItem } from "../types.ts";
 
+const CATEGORY_ALIASES: Record<string, string> = {
+  rule: "rule",
+  rules: "rule",
+  preference: "preference",
+  preferences: "preference",
+  identity: "identity",
+  identities: "identity",
+  decision: "decision",
+  decisions: "decision",
+  configuration: "configuration",
+  configurations: "configuration",
+  config: "configuration",
+  project: "project",
+  projects: "project",
+  technical: "technical",
+  relationship: "relationship",
+  relationships: "relationship",
+  operational: "operational",
+};
+
+function normalizeCategory(category: string): string {
+  const normalized = category.trim().toLowerCase();
+  return CATEGORY_ALIASES[normalized] ?? normalized;
+}
+
 export function getMemoryCategory(memory: MemoryItem): string {
   if (
     memory.metadata?.category &&
     typeof memory.metadata.category === "string"
   ) {
-    return memory.metadata.category;
+    return normalizeCategory(memory.metadata.category);
   }
-  return memory.categories?.[0] ?? "uncategorized";
+  const firstCategory = memory.categories?.[0];
+  if (typeof firstCategory === "string" && firstCategory.trim()) {
+    return normalizeCategory(firstCategory);
+  }
+  return "uncategorized";
 }
 
 export function normalizeMemoryText(text: string): string {

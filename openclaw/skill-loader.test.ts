@@ -2,7 +2,7 @@
  * Tests for path traversal prevention in skill-loader.
  */
 import { describe, it, expect } from "vitest";
-import { safePath, loadSkill } from "./skill-loader.ts";
+import { safePath, loadSkill, loadTriagePrompt } from "./skill-loader.ts";
 
 // ---------------------------------------------------------------------------
 // safePath — path containment
@@ -66,5 +66,47 @@ describe("loadSkill path traversal", () => {
     // Should still succeed (skill itself is valid), domain overlay is just skipped
     expect(result).not.toBeNull();
     expect(result?.prompt).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// loadTriagePrompt — recall protocol injection
+// ---------------------------------------------------------------------------
+describe("loadTriagePrompt recall protocol", () => {
+  it("includes the recall protocol when recall is enabled", () => {
+    const prompt = loadTriagePrompt({ recall: { enabled: true } });
+
+    expect(prompt).toContain("# Recalled Memories");
+    expect(prompt).toContain("Do not add bridge terms");
+    expect(prompt).toContain('memory_search("nutritionist wife recommended")');
+    expect(prompt).toContain('memory_search("message queue picked why")');
+    expect(prompt).toContain('memory_search("timezone")');
+    expect(prompt).toContain('memory_search("deploy always before")');
+    expect(prompt).toContain('memory_search("onboarding redesign")');
+  });
+
+  it("does not include the recall protocol when recall is disabled", () => {
+    const prompt = loadTriagePrompt({ recall: { enabled: false } });
+
+    expect(prompt).not.toContain("# Recalled Memories");
+    expect(prompt).not.toContain('memory_search("nutritionist wife recommended")');
+  });
+
+  it("does not include obsolete bridge-term examples", () => {
+    const prompt = loadTriagePrompt({ recall: { enabled: true } });
+
+    expect(prompt).not.toContain("nutritionist wife recommended relationship");
+    expect(prompt).not.toContain("message queue decision chose rationale");
+    expect(prompt).not.toContain("user timezone location based");
+    expect(prompt).not.toContain("rule deploy always before");
+    expect(prompt).not.toContain("onboarding redesign project status");
+    expect(prompt).not.toContain("sister birthday date relationship");
+    expect(prompt).not.toContain("project status milestone");
+  });
+
+  it("does not require a hosted mem0 API key in injected skills", () => {
+    const prompt = loadTriagePrompt({ recall: { enabled: true } });
+
+    expect(prompt).not.toContain("MEM0_API_KEY");
   });
 });

@@ -24,7 +24,7 @@ import {
 const DEFAULT_TOKEN_BUDGET = 400;
 const DEFAULT_RAW_TOP_K = 8;
 const DEFAULT_FINAL_MAX_MEMORIES = 4;
-const DEFAULT_THRESHOLD = 0.6;
+const DEFAULT_THRESHOLD = 0.5;
 const DEFAULT_RELATIVE_SCORE_THRESHOLD = 0.72;
 const DEFAULT_SHORT_QUERY_CHARS = 12;
 const DEFAULT_CATEGORY_ORDER = [
@@ -156,67 +156,6 @@ const QUERY_NOISE_PHRASES = [
   "哪里",
 ];
 
-const PREFERENCE_HINTS = [
-  "喜欢吃",
-  "喜欢喝",
-  "喜欢",
-  "偏好",
-  "爱好",
-  "习惯",
-  "口味",
-  "爱吃",
-  "爱喝",
-];
-
-const IDENTITY_HINTS = [
-  "时区",
-  "timezone",
-  "location",
-  "name",
-  "称呼",
-];
-
-const RULE_HINTS = [
-  "规则",
-  "必须",
-  "禁止",
-  "不要",
-  "不能",
-  "always",
-  "never",
-];
-
-const DECISION_HINTS = [
-  "决定",
-  "选择",
-  "原因",
-  "rationale",
-  "why",
-  "picked",
-  "chose",
-];
-
-const CONFIG_HINTS = [
-  "配置",
-  "设置",
-  "怎么配",
-  "参数",
-  "版本",
-  "安装",
-  "修改",
-  "切换",
-];
-
-const PROJECT_HINTS = [
-  "项目",
-  "进度",
-  "状态",
-  "里程碑",
-  "milestone",
-  "project",
-  "task",
-];
-
 const CHARS_PER_TOKEN = 4;
 
 export interface RecallResult {
@@ -226,6 +165,10 @@ export interface RecallResult {
   debug: {
     decision: "skip" | "long_term" | "long_term_plus_session";
     skipReason?: string;
+    searchQuery: string;
+    threshold: number;
+    rawTopK: number;
+    sessionSearchEnabled: boolean;
     rawCandidateCount: number;
     postThresholdCount: number;
     postDedupeCount: number;
@@ -237,14 +180,7 @@ type RecallDecision =
   | { decision: "long_term" }
   | { decision: "long_term_plus_session" };
 
-export type MemoryQueryIntent =
-  | "preference"
-  | "identity"
-  | "rule"
-  | "decision"
-  | "configuration"
-  | "project"
-  | "generic";
+export type MemoryQueryIntent = "generic";
 
 export interface MemoryQueryAnalysis {
   original: string;
@@ -287,130 +223,32 @@ function wantsIdentityContext(text: string): boolean {
   return includesAny(text, IDENTITY_QUERY_PATTERNS);
 }
 
-function hasAnyHint(text: string, patterns: string[]): boolean {
-  return patterns.some((pattern) => text.includes(pattern.toLowerCase()));
-}
-
-function classifyMemoryQuery(normalized: string): MemoryQueryIntent {
-  if (hasAnyHint(normalized, PREFERENCE_HINTS)) return "preference";
-  if (hasAnyHint(normalized, IDENTITY_HINTS)) return "identity";
-  if (hasAnyHint(normalized, RULE_HINTS)) return "rule";
-  if (hasAnyHint(normalized, DECISION_HINTS)) return "decision";
-  if (hasAnyHint(normalized, CONFIG_HINTS)) return "configuration";
-  if (hasAnyHint(normalized, PROJECT_HINTS)) return "project";
-  return "generic";
-}
-
-function buildMemoryQueryTokens(
-  normalized: string,
-): { tokens: string[]; hasFirstPerson: boolean; hasQuestionFrame: boolean } {
-  const hasFirstPerson = /(?:我的|我|咱们|咱|本人|自己)/.test(normalized);
+export function analyzeMemoryQuery(rawQuery: string): MemoryQueryAnalysis {
+  const cleaned = normalizeText(sanitizeQuery(rawQuery));
+  const normalized = cleaned.toLowerCase();
+  const hasFirstPerson = /(?:我的|我|咱们|咱|本人|自己|你)/.test(normalized);
   const hasQuestionFrame = /(?:吗|嘛|吧|呢|呀|啊|么|什么|哪些|哪种|哪样|怎么|为何|为什么|如何|多少|几|谁|哪儿|哪里)/.test(
     normalized,
   );
 
-  let working = normalized;
-  const orderedNoisePhrases = [...QUERY_NOISE_PHRASES].sort(
-    (a, b) => b.length - a.length,
-  );
-  for (const phrase of orderedNoisePhrases) {
-    working = working.split(phrase.toLowerCase()).join(" ");
-  }
-  working = working.replace(
-    /(?:我的|我|咱们|咱|本人|自己)/g,
-    " 用户 ",
-  );
-  working = working.replace(/[?？!！。.,，、；;:：/\\|()[\]{}"'`~\-]/g, " ");
-  working = working.replace(/\s+/g, " ").trim();
-
-  const tokens = new Set(
-    working
-      .split(" ")
-      .map((token) => token.trim())
-      .filter(Boolean),
-  );
-
-  if (hasFirstPerson) tokens.add("用户");
-  return { tokens: [...tokens], hasFirstPerson, hasQuestionFrame };
-}
-
-function addBridgeTerms(
-  tokens: Set<string>,
-  normalized: string,
-  intent: MemoryQueryIntent,
-): void {
-  if (intent === "preference") {
-    tokens.add("偏好");
-    if (/(喜欢吃|喜欢喝|爱吃|爱喝|吃什么|喝什么)/.test(normalized)) {
-      tokens.add("食物");
-    }
-    return;
-  }
-
-  if (intent === "identity") {
-    tokens.add("用户");
-    return;
-  }
-
-  if (intent === "rule") {
-    tokens.add("规则");
-    return;
-  }
-
-  if (intent === "decision") {
-    tokens.add("决定");
-    return;
-  }
-
-  if (intent === "configuration") {
-    tokens.add("配置");
-    return;
-  }
-
-  if (intent === "project") {
-    tokens.add("项目");
-  }
-}
-
-export function analyzeMemoryQuery(rawQuery: string): MemoryQueryAnalysis {
-  const cleaned = normalizeText(sanitizeQuery(rawQuery));
-  const normalized = cleaned.toLowerCase();
-  const { tokens, hasFirstPerson, hasQuestionFrame } =
-    buildMemoryQueryTokens(normalized);
-  const intent = classifyMemoryQuery(normalized);
-  const tokenSet = new Set(tokens);
-  addBridgeTerms(tokenSet, normalized, intent);
-
-  const rewritten = [...tokenSet]
-    .filter(Boolean)
-    .slice(0, 6)
-    .join(" ")
-    .trim();
-
   return {
     original: rawQuery,
     cleaned,
-    rewritten: rewritten || cleaned || rawQuery.trim(),
-    intent,
+    rewritten: cleaned || rawQuery.trim(),
+    intent: "generic",
     hasFirstPerson,
     hasQuestionFrame,
   };
 }
 
 export function rewriteMemoryQuery(rawQuery: string): string {
-  return analyzeMemoryQuery(rawQuery).rewritten;
+  return sanitizeQuery(rawQuery);
 }
 
 export function getAdaptiveSearchThreshold(
-  rawQuery: string,
+  _rawQuery: string,
   baseThreshold: number,
 ): number {
-  const { intent } = analyzeMemoryQuery(rawQuery);
-  if (intent === "preference") return Math.min(baseThreshold, 0.45);
-  if (intent === "identity") return Math.min(baseThreshold, 0.5);
-  if (intent === "rule" || intent === "decision" || intent === "configuration" || intent === "project") {
-    return Math.min(baseThreshold, 0.55);
-  }
   return baseThreshold;
 }
 
@@ -452,13 +290,30 @@ function getMemoryImportance(memory: MemoryItem): number {
   return defaults[cat] ?? 0.5;
 }
 
+function getQueryTerms(query: string): string[] {
+  const normalized = normalizeText(query);
+  return normalized
+    .split(/\s+/)
+    .map((term) => term.trim())
+    .filter((term) => term.length >= 1);
+}
+
+function getQueryTermOverlap(memory: MemoryItem, queryTerms: string[]): number {
+  if (queryTerms.length === 0) return 0;
+  const memoryText = normalizeText(memory.memory);
+  const matched = queryTerms.filter((term) => memoryText.includes(term)).length;
+  return matched / queryTerms.length;
+}
+
 function rankMemories(
   memories: MemoryItem[],
+  query: string,
   categoryOrder: string[],
   identityMode: "always" | "on-demand" | "never",
   wantsIdentity: boolean,
 ): MemoryItem[] {
   const orderMap = new Map(categoryOrder.map((cat, i) => [cat, i]));
+  const queryTerms = getQueryTerms(query);
 
   return [...memories].sort((a, b) => {
     const catA = getMemoryCategory(a);
@@ -477,13 +332,21 @@ function rankMemories(
       if (catB === "identity") adjustedOrderB = 999;
     }
 
+    const scoreA = a.score ?? 0;
+    const scoreB = b.score ?? 0;
+    const overlapA = getQueryTermOverlap(a, queryTerms);
+    const overlapB = getQueryTermOverlap(b, queryTerms);
+    const relevanceA = scoreA + overlapA * 0.15;
+    const relevanceB = scoreB + overlapB * 0.15;
+    if (relevanceA !== relevanceB) return relevanceB - relevanceA;
+
     if (adjustedOrderA !== adjustedOrderB) return adjustedOrderA - adjustedOrderB;
 
     const impA = getMemoryImportance(a);
     const impB = getMemoryImportance(b);
     if (impA !== impB) return impB - impA;
 
-    return (b.score ?? 0) - (a.score ?? 0);
+    return scoreB - scoreA;
   });
 }
 
@@ -598,7 +461,7 @@ function formatRecalledMemories(
   for (const [section, items] of Object.entries(grouped)) {
     if (items.length === 0) continue;
     lines.push(`${section}:`);
-    for (const item of items.slice(0, 2)) {
+    for (const item of items) {
       lines.push(`- ${item}`);
     }
     lines.push("");
@@ -678,10 +541,7 @@ export async function recall(
     recallConfig.finalMaxMemories ??
     recallConfig.maxMemories ??
     DEFAULT_FINAL_MAX_MEMORIES;
-  const threshold = getAdaptiveSearchThreshold(
-    query,
-    recallConfig.threshold ?? DEFAULT_THRESHOLD,
-  );
+  const threshold = recallConfig.threshold ?? DEFAULT_THRESHOLD;
   const relativeScoreThreshold =
     recallConfig.relativeScoreThreshold ?? DEFAULT_RELATIVE_SCORE_THRESHOLD;
   const categoryOrder = recallConfig.categoryOrder ?? DEFAULT_CATEGORY_ORDER;
@@ -699,8 +559,7 @@ export async function recall(
     filter_memories: recallConfig.filterMemories !== false,
   };
 
-  const cleanQuery = sanitizeQuery(query);
-  const searchQuery = rewriteMemoryQuery(cleanQuery);
+  const searchQuery = sanitizeQuery(query);
 
   let longTermMemories: MemoryItem[] = [];
   try {
@@ -745,6 +604,7 @@ export async function recall(
 
   const ranked = rankMemories(
     deduped,
+    searchQuery,
     categoryOrder,
     identityMode,
     wantsIdentity,
@@ -766,6 +626,10 @@ export async function recall(
     tokenEstimate,
     debug: {
       decision: sessionId ? "long_term_plus_session" : "long_term",
+      searchQuery,
+      threshold,
+      rawTopK,
+      sessionSearchEnabled: Boolean(sessionId),
       rawCandidateCount,
       postThresholdCount,
       postDedupeCount,

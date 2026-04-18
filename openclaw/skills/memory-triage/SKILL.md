@@ -7,7 +7,7 @@ description: >
   projects, and relationships. Loaded by the openclaw-mem0 plugin when skills mode is active.
 user-invocable: false
 metadata:
-  {"openclaw": {"always": false, "emoji": "🧠", "requires": {"env": ["MEM0_API_KEY"], "bins": []}}}
+  {"openclaw": {"always": false, "emoji": "🧠", "requires": {"env": [], "bins": []}}}
 ---
 
 # Memory Protocol
@@ -44,6 +44,19 @@ Every candidate fact must pass ALL four gates:
   - When in doubt → SKIP. No exceptions.
 
 All four gates must pass. If any fails → do nothing.
+
+## Active Save Triggers
+
+Most turns still produce zero memory operations. However, if the user gives durable information that passes the four gates, evaluate it immediately in the same turn and call `memory_add`.
+
+Strong signals include:
+- Explicit memory requests: "remember", "记住", "以后", "默认", "以后都", "我的规则", "我的偏好"
+- Preferences: "I like", "I dislike", "I prefer", "我喜欢", "我不喜欢", "我偏好"
+- Standing rules or workflow policies
+- Stable project paths, repository paths, tool choices, model choices, environment configuration, or agent configuration
+- Durable personal facts, roles, relationships, or long-running project decisions
+
+Before saving, check recalled memories. If the same fact is already present and unchanged, skip. Do not save recalled memories back into memory unless the user materially corrects or expands them.
 
 ## What to Extract (Priority Order)
 
