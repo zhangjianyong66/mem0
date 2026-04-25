@@ -2,6 +2,10 @@
  * Mem0 provider implementations: Platform (cloud) and OSS (self-hosted).
  */
 
+import { constants as fsConstants } from "node:fs";
+import { access, mkdir } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import type {
   Mem0Config,
@@ -240,6 +244,34 @@ class OSSProvider implements Mem0Provider {
     return this.initPromise;
   }
 
+  private resolveHistoryDbPath(): { path: string; relativeInput?: string } {
+    const configured = this.ossConfig?.historyDbPath?.trim();
+    const homeOpenclawDir = path.join(os.homedir(), ".openclaw");
+    const defaultHistoryDbPath = path.join(homeOpenclawDir, "mem0", "history.db");
+
+    if (!configured) {
+      return { path: defaultHistoryDbPath };
+    }
+
+    const tildeExpanded = configured.startsWith("~/")
+      ? path.join(os.homedir(), configured.slice(2))
+      : configured;
+    const resolvedCandidate = this.resolvePath
+      ? this.resolvePath(tildeExpanded)
+      : tildeExpanded;
+    const resolved = typeof resolvedCandidate === "string" && resolvedCandidate.trim()
+      ? resolvedCandidate
+      : tildeExpanded;
+    if (path.isAbsolute(resolved)) {
+      return { path: resolved };
+    }
+
+    return {
+      path: path.resolve(homeOpenclawDir, resolved),
+      relativeInput: configured,
+    };
+  }
+
   private _buildConfig(disableHistory = false): Record<string, unknown> {
     const config: Record<string, unknown> = { version: "v1.1" };
 
@@ -288,19 +320,72 @@ class OSSProvider implements Mem0Provider {
     if (this.ossConfig?.vectorStore)
       config.vectorStore = { ...this.ossConfig.vectorStore };
 
-    if (this.ossConfig?.historyDbPath) {
-      const dbPath = this.resolvePath
-        ? this.resolvePath(this.ossConfig.historyDbPath)
-        : this.ossConfig.historyDbPath;
-      config.historyDbPath = dbPath;
-    }
+    const historyPathResolution = this.resolveHistoryDbPath();
+    config.historyDbPath = historyPathResolution.path;
+    config.historyStore = {
+      provider: "sqlite",
+      config: { historyDbPath: historyPathResolution.path },
+    };
 
     if (disableHistory || this.ossConfig?.disableHistory) {
       config.disableHistory = true;
     }
 
+    if (historyPathResolution.relativeInput) {
+      console.warn(
+        "[mem0] Relative historyDbPath resolved to absolute path:",
+        `${historyPathResolution.relativeInput} -> ${historyPathResolution.path}`,
+      );
+    }
+
     if (this.customPrompt) config.customPrompt = this.customPrompt;
     return config;
+  }
+
+  private async ensureHistoryDbPathWritable(config: Record<string, unknown>): Promise<void> {
+    if (config.disableHistory === true) return;
+    const historyDbPath = config.historyDbPath;
+    if (typeof historyDbPath !== "string" || historyDbPath.trim().length === 0) return;
+
+    const resolvedHistoryDbPath = historyDbPath.trim();
+    const historyDir = path.dirname(resolvedHistoryDbPath);
+
+    try {
+      await mkdir(historyDir, { recursive: true });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`historyDbPath directory create failed (${historyDir}): ${message}`);
+    }
+
+    try {
+      await access(historyDir, fsConstants.W_OK);
+    } catch {
+      throw new Error(`historyDbPath directory is not writable: ${historyDir}`);
+    }
+
+    try {
+      await access(resolvedHistoryDbPath, fsConstants.F_OK);
+      await access(resolvedHistoryDbPath, fsConstants.W_OK);
+    } catch (err) {
+      const errorCode = (err as NodeJS.ErrnoException | null)?.code;
+      if (errorCode === "ENOENT") return;
+      throw new Error(`historyDbPath is not writable: ${resolvedHistoryDbPath}`);
+    }
+  }
+
+  private formatInitFailure(err: unknown): string {
+    const raw = err instanceof Error ? err.message : String(err);
+    const lowered = raw.toLowerCase();
+    if (lowered.includes("unable to open database file")) {
+      return `${raw} (check historyDbPath target and write permissions)`;
+    }
+    if (lowered.includes("bindings file")) {
+      return `${raw} (sqlite native bindings are unavailable in this runtime)`;
+    }
+    if (lowered.includes("incompatible with server version")) {
+      return `${raw} (upgrade @qdrant/js-client-rest to match Qdrant server minor version)`;
+    }
+    return raw;
   }
 
   private async _init(): Promise<void> {
@@ -331,15 +416,20 @@ class OSSProvider implements Mem0Provider {
     }
 
     let mem: any;
+    const baseConfig = this._buildConfig();
     try {
-      mem = new Memory(this._buildConfig());
+      if (typeof baseConfig.historyDbPath === "string" && baseConfig.historyDbPath.trim()) {
+        console.info("[mem0] Effective historyDbPath:", baseConfig.historyDbPath);
+      }
+      await this.ensureHistoryDbPathWritable(baseConfig);
+      mem = new Memory(baseConfig);
     } catch (err) {
       // If constructor fails (e.g. native SQLite binding under jiti/Docker),
       // retry with a FRESH config that has history disabled.
       if (!this.ossConfig?.disableHistory) {
         console.warn(
           "[mem0] Memory initialization failed, retrying with history disabled:",
-          err instanceof Error ? err.message : err,
+          this.formatInitFailure(err),
         );
         mem = new Memory(this._buildConfig(true));
       } else {
@@ -347,7 +437,11 @@ class OSSProvider implements Mem0Provider {
       }
     }
 
-    await mem.getAll({ userId: "__mem0_warmup__" });
+    try {
+      await mem.getAll({ userId: "__mem0_warmup__" });
+    } catch (err) {
+      throw new Error(`[mem0] Warmup failed: ${this.formatInitFailure(err)}`);
+    }
 
     this.memory = mem;
   }

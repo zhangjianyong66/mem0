@@ -60,6 +60,10 @@ Customize the embedder, vector store, or LLM via the `oss` block:
 }
 ```
 
+Qdrant compatibility note: keep `@qdrant/js-client-rest` on the same major version as your Qdrant server, and keep the minor version gap within 1 to avoid startup compatibility warnings.
+
+`oss.historyDbPath` note: the parent directory must exist and be writable by the OpenClaw process. If history DB initialization fails, the plugin retries with `disableHistory=true`.
+
 All `oss` fields are optional. See the [Mem0 OSS docs](https://docs.mem0.ai/open-source/node-quickstart) for supported providers.
 
 ## How It Works

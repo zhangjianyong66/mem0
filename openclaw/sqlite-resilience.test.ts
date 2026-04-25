@@ -6,6 +6,8 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mem0ConfigSchema, createProvider } from "./index.ts";
+import os from "node:os";
+import path from "node:path";
 
 /** Stub vector-store classes required by OSSProvider._init's patching loop. */
 function vectorStubs() {
@@ -291,6 +293,30 @@ describe("OSSProvider — graceful SQLite fallback", () => {
       "vector store connection refused",
     );
   });
+
+  it("falls back to disableHistory when historyDbPath is invalid", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { createProvider } = await import("./index.ts");
+    const cfg = mem0ConfigSchema.parse({
+      mode: "open-source",
+      oss: { historyDbPath: "/dev/null/history.db" },
+    });
+    const api = { resolvePath: (p: string) => p } as any;
+    const provider = createProvider(cfg, api);
+
+    const results = await provider.search("test", { user_id: "u1" });
+    expect(results).toBeDefined();
+
+    // First init fails during historyDbPath pre-check before Memory constructor.
+    // Fallback path builds a fresh disableHistory config and succeeds.
+    expect(capturedConfigs).toHaveLength(1);
+    expect(capturedConfigs[0].disableHistory).toBe(true);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("[mem0] Memory initialization failed"),
+      expect.stringContaining("historyDbPath"),
+    );
+    warnSpy.mockRestore();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -394,7 +420,7 @@ describe("OSSProvider — _buildConfig branch coverage", () => {
         disableHistory: true,
       },
     });
-    const api = { resolvePath: (p: string) => `/resolved${p}` } as any;
+    const api = { resolvePath: (p: string) => p } as any;
     const provider = createProvider(cfg, api);
 
     await provider.search("test", { user_id: "u1" });
@@ -409,8 +435,73 @@ describe("OSSProvider — _buildConfig branch coverage", () => {
       config: expect.objectContaining({ model: "gpt-4", apiKey: "sk-l" }),
     });
     expect(capturedConfig!.vectorStore).toEqual({ provider: "qdrant", config: { host: "localhost", port: 6333 } });
-    expect(capturedConfig!.historyDbPath).toBe("/resolved/tmp/history.db");
+    expect(capturedConfig!.historyDbPath).toBe("/tmp/history.db");
+    expect(capturedConfig!.historyStore).toEqual({
+      provider: "sqlite",
+      config: { historyDbPath: "/tmp/history.db" },
+    });
     expect(capturedConfig!.disableHistory).toBe(true);
+  });
+
+  it("uses absolute default history path when historyDbPath is not configured", async () => {
+    const { createProvider } = await import("./index.ts");
+    const cfg = mem0ConfigSchema.parse({
+      mode: "open-source",
+      oss: { disableHistory: true },
+    });
+    const api = { resolvePath: (p: string) => p } as any;
+    const provider = createProvider(cfg, api);
+
+    await provider.search("test", { user_id: "u1" });
+
+    const expected = path.join(os.homedir(), ".openclaw", "mem0", "history.db");
+    expect(capturedConfig).toBeDefined();
+    expect(capturedConfig!.historyDbPath).toBe(expected);
+    expect(capturedConfig!.historyStore).toEqual({
+      provider: "sqlite",
+      config: { historyDbPath: expected },
+    });
+  });
+
+  it("normalizes relative historyDbPath to absolute path under ~/.openclaw", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { createProvider } = await import("./index.ts");
+    const cfg = mem0ConfigSchema.parse({
+      mode: "open-source",
+      oss: { historyDbPath: "./mem0/custom-history.db", disableHistory: true },
+    });
+    const api = { resolvePath: (p: string) => p } as any;
+    const provider = createProvider(cfg, api);
+
+    await provider.search("test", { user_id: "u1" });
+
+    const expected = path.join(os.homedir(), ".openclaw", "mem0", "custom-history.db");
+    expect(capturedConfig).toBeDefined();
+    expect(capturedConfig!.historyDbPath).toBe(expected);
+    expect((capturedConfig!.historyStore as any).config.historyDbPath).toBe(expected);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("[mem0] Relative historyDbPath resolved to absolute path:"),
+      expect.stringContaining("./mem0/custom-history.db"),
+    );
+    warnSpy.mockRestore();
+  });
+
+  it("falls back to original historyDbPath when resolvePath returns undefined", async () => {
+    const { createProvider } = await import("./index.ts");
+    const cfg = mem0ConfigSchema.parse({
+      mode: "open-source",
+      oss: { historyDbPath: "/tmp/fallback-history.db", disableHistory: true },
+    });
+    const api = { resolvePath: () => undefined } as any;
+    const provider = createProvider(cfg, api);
+
+    await provider.search("test", { user_id: "u1" });
+
+    expect(capturedConfig).toBeDefined();
+    expect(capturedConfig!.historyDbPath).toBe("/tmp/fallback-history.db");
+    expect((capturedConfig!.historyStore as any).config.historyDbPath).toBe(
+      "/tmp/fallback-history.db",
+    );
   });
 
   it("strips empty-string values from embedder and llm config", async () => {

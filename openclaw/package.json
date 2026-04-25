@@ -37,6 +37,11 @@
     "@sinclair/typebox": "0.34.47",
     "mem0ai": "2.4.5"
   },
+  "pnpm": {
+    "overrides": {
+      "@qdrant/js-client-rest": "1.17.0"
+    }
+  },
   "openclaw": {
     "extensions": [
       "./dist/index.js"
